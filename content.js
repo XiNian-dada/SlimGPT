@@ -7,17 +7,22 @@
     userRole: "user",
     assistantRole: "assistant",
     turnsAroundViewport: 3,
-    maxTurnsAroundViewportFastScroll: 36,
-    jumpPreloadTurns: 56,
+    maxTurnsAroundViewportFastScroll: 12,
+    jumpPreloadTurns: 24,
+    maxLiveTurns: 8,
+    maxLiveTurnsTyping: 4,
     minimapVisibleDots: 20,
     minimapThrottleMs: 140,
     typingMinimapThrottleMs: 260,
     fastScrollWindowMs: 220,
     collapseOpsPerFrame: 4,
-    collapsePauseAfterScrollMs: 650,
+    collapseOpsPerFrameTyping: 1,
+    budgetCollapseOpsPerSync: 40,
+    budgetCollapseOpsPerSyncTyping: 10,
+    collapsePauseAfterScrollMs: 160,
     modelRebuildMinIntervalMs: 220,
     pinToBottomThresholdPx: 260,
-    startupCollapseDelayMs: 900,
+    startupCollapseDelayMs: 160,
     typingHotMs: 1300,
     maxSnippetLength: 120,
     minPlaceholderHeight: 24
@@ -40,8 +45,6 @@
     allowCollapseAt: performance.now() + CONFIG.startupCollapseDelayMs,
 
     scrollRoot: null,
-    domObserver: null,
-    observedRoot: null,
     messages: [],
     messageById: new Map(),
     turnToIds: new Map(),
@@ -55,6 +58,7 @@
     typingSyncDueAt: 0,
 
     collapsedById: new Map(),
+    heightById: new Map(),
     collapseTargetRange: null,
     collapseWorkerRunning: false,
     collapsePlan: null
@@ -205,7 +209,6 @@
   function markTypingActivity() {
     STATE.inputFocused = true;
     STATE.lastInputAt = Date.now();
-    STATE.allowCollapseAt = performance.now() + CONFIG.typingHotMs;
 
     // Keep only one pending sync and move it after the latest keystroke.
     if (STATE.modelDirty || STATE.typingSyncTimer !== 0) {
@@ -273,7 +276,7 @@
   }
 
   function observeDomChanges() {
-    STATE.domObserver = new MutationObserver((records) => {
+    const observer = new MutationObserver((records) => {
       if (STATE.observerMuted) {
         return;
       }
@@ -308,54 +311,11 @@
       STATE.modelDirty = true;
       scheduleSync();
     });
-    refreshObserverTarget();
-  }
 
-  function refreshObserverTarget() {
-    if (!(STATE.domObserver instanceof MutationObserver)) {
-      return;
-    }
-
-    const target = resolveObserverTarget();
-    if (!(target instanceof Element)) {
-      return;
-    }
-
-    if (STATE.observedRoot === target) {
-      return;
-    }
-
-    STATE.domObserver.disconnect();
-    STATE.domObserver.observe(target, {
+    observer.observe(document.documentElement, {
       childList: true,
       subtree: true
     });
-    STATE.observedRoot = target;
-  }
-
-  function resolveObserverTarget() {
-    const sample = document.querySelector(CONFIG.messageSelector);
-    if (sample instanceof HTMLElement) {
-      const messageRoot = getMessageRoot(sample);
-      if (messageRoot instanceof HTMLElement) {
-        const scrollable = findScrollableAncestor(messageRoot);
-        if (scrollable) {
-          return scrollable;
-        }
-
-        const main = messageRoot.closest("main");
-        if (main instanceof HTMLElement) {
-          return main;
-        }
-      }
-    }
-
-    const main = document.querySelector("main");
-    if (main instanceof HTMLElement) {
-      return main;
-    }
-
-    return document.body || document.documentElement;
   }
 
   function hasStructuralMutation(records) {
@@ -364,11 +324,7 @@
         continue;
       }
 
-      if (mutationNodeListHasTrackedMessage(record.addedNodes)) {
-        return true;
-      }
-
-      if (mutationNodeListHasTrackedMessage(record.removedNodes)) {
+      if (isThreadMutationRecord(record)) {
         return true;
       }
     }
@@ -376,17 +332,24 @@
     return false;
   }
 
-  function mutationNodeListHasTrackedMessage(nodeList) {
-    for (const node of nodeList) {
-      if (!(node instanceof Element)) {
-        continue;
-      }
+  function isThreadMutationRecord(record) {
+    if (record.addedNodes.length === 0 && record.removedNodes.length === 0) {
+      return false;
+    }
 
-      if (node.matches(CONFIG.messageSelector) || node.matches(CONFIG.placeholderSelector)) {
+    const target = record.target;
+    if (target instanceof Element && target.closest("[data-slimgpt-item='1'], article[data-testid^='conversation-turn']")) {
+      return true;
+    }
+
+    for (const node of record.addedNodes) {
+      if (node instanceof Element && node.matches("article[data-testid^='conversation-turn']")) {
         return true;
       }
+    }
 
-      if (node.querySelector(CONFIG.messageSelector) || node.querySelector(CONFIG.placeholderSelector)) {
+    for (const node of record.removedNodes) {
+      if (node instanceof Element && node.matches("article[data-testid^='conversation-turn']")) {
         return true;
       }
     }
@@ -428,10 +391,8 @@
       STATE.lastInputAt = 0;
       STATE.inputFocused = false;
       STATE.composing = false;
-      STATE.observedRoot = null;
 
       restoreAllCollapsedMessages();
-      refreshObserverTarget();
       scheduleSync();
     }, 900);
   }
@@ -480,7 +441,15 @@
     }
 
     if (typingHot && !scrollingHot) {
-      // Typing has highest priority: avoid heavy turn-window recompute while user is entering text.
+      // Typing has highest priority for rendering, but still keep collapsing far turns in background.
+      const anchorTurn = findAnchorTurn();
+      STATE.previousAnchorTurn = STATE.currentAnchorTurn;
+      STATE.currentAnchorTurn = anchorTurn;
+      const minTurn = clamp(anchorTurn - 1, 0, STATE.totalTurns - 1);
+      const maxTurn = clamp(anchorTurn + 1, 0, STATE.totalTurns - 1);
+      enforceLiveTurnBudget(anchorTurn, true);
+      requestBackgroundCollapse(minTurn, maxTurn);
+      updateMiniMap();
       scheduleSyncAfterTyping(false);
       return;
     }
@@ -499,6 +468,9 @@
 
     // Critical path: restore around viewport immediately.
     restoreTurnsImmediately(minTurn, maxTurn);
+
+    // Hard cap: never keep too many full turns in DOM.
+    enforceLiveTurnBudget(anchorTurn, false);
 
     // Background path: collapse far turns lazily.
     requestBackgroundCollapse(minTurn, maxTurn);
@@ -592,7 +564,6 @@
 
     STATE.totalTurns = Math.max(0, turn + 1);
     resolveScrollRoot(sampleRoot);
-    refreshObserverTarget();
 
     if (STATE.totalTurns === 0) {
       STATE.currentAnchorTurn = 0;
@@ -660,10 +631,6 @@
   }
 
   function requestBackgroundCollapse(minTurn, maxTurn) {
-    if (isTypingHot()) {
-      return;
-    }
-
     const target = {
       min: minTurn,
       max: maxTurn,
@@ -686,12 +653,6 @@
   function collapseWorkerTick() {
     if (STATE.mode !== "dynamic") {
       STATE.collapseWorkerRunning = false;
-      return;
-    }
-
-    if (isTypingHot()) {
-      STATE.collapseWorkerRunning = false;
-      scheduleSyncAfterTyping(false);
       return;
     }
 
@@ -738,11 +699,13 @@
       return;
     }
 
+    const typingHot = isTypingHot();
+    const opsLimit = typingHot ? CONFIG.collapseOpsPerFrameTyping : CONFIG.collapseOpsPerFrame;
     let ops = 0;
     muteObserver(true);
 
-    while (ops < CONFIG.collapseOpsPerFrame && plan.index < plan.queue.length) {
-      collapseMessage(plan.queue[plan.index]);
+    while (ops < opsLimit && plan.index < plan.queue.length) {
+      collapseMessage(plan.queue[plan.index], typingHot);
       plan.index += 1;
       ops += 1;
     }
@@ -775,6 +738,58 @@
     muteObserver(false);
   }
 
+  function enforceLiveTurnBudget(anchorTurn, typingHot) {
+    if (STATE.totalTurns <= 0) {
+      return;
+    }
+
+    const budgetTurns = typingHot ? CONFIG.maxLiveTurnsTyping : CONFIG.maxLiveTurns;
+    if (STATE.totalTurns <= budgetTurns) {
+      return;
+    }
+
+    const maxOps = typingHot
+      ? CONFIG.budgetCollapseOpsPerSyncTyping
+      : CONFIG.budgetCollapseOpsPerSync;
+    if (maxOps <= 0) {
+      return;
+    }
+
+    const keepStart = clamp(
+      anchorTurn - Math.floor((budgetTurns - 1) / 2),
+      0,
+      Math.max(STATE.totalTurns - budgetTurns, 0)
+    );
+    const keepEnd = clamp(keepStart + budgetTurns - 1, 0, STATE.totalTurns - 1);
+
+    let ops = 0;
+    muteObserver(true);
+
+    for (const item of STATE.messages) {
+      if (ops >= maxOps) {
+        break;
+      }
+
+      if (item.isPlaceholder) {
+        continue;
+      }
+
+      if (item.turnIndex >= keepStart && item.turnIndex <= keepEnd) {
+        continue;
+      }
+
+      collapseMessage(item.id, true);
+      ops += 1;
+    }
+
+    muteObserver(false);
+
+    // Continue trimming on next frame when there is still excess full DOM.
+    if (ops >= maxOps) {
+      scheduleSync();
+    }
+  }
+
   function getDynamicTurnsAroundViewport(anchorDelta) {
     const base = CONFIG.turnsAroundViewport;
     const fastScroll = Date.now() - STATE.lastScrollAt < CONFIG.fastScrollWindowMs;
@@ -793,7 +808,7 @@
     );
   }
 
-  function collapseMessage(id) {
+  function collapseMessage(id, lowCostMode = false) {
     const item = STATE.messageById.get(id);
     if (!item || item.isPlaceholder) {
       return;
@@ -805,11 +820,16 @@
       return;
     }
 
-    const height = Math.max(
-      node.getBoundingClientRect().height,
-      node.offsetHeight,
-      CONFIG.minPlaceholderHeight
-    );
+    let height = STATE.heightById.get(id) || 0;
+    if (height <= 0) {
+      if (lowCostMode) {
+        // Avoid layout reads while typing: estimate and remove heavy DOM first.
+        height = item.role === CONFIG.userRole ? 84 : 180;
+      } else {
+        height = Math.max(node.offsetHeight, CONFIG.minPlaceholderHeight);
+      }
+      STATE.heightById.set(id, height);
+    }
 
     const placeholder = document.createElement("div");
     placeholder.className = "slimgpt-placeholder";
@@ -845,6 +865,11 @@
 
     if (record.placeholder.isConnected) {
       record.placeholder.replaceWith(record.node);
+    }
+
+    if (!STATE.heightById.has(id) && record.node.isConnected) {
+      const measured = Math.max(record.node.offsetHeight, CONFIG.minPlaceholderHeight);
+      STATE.heightById.set(id, measured);
     }
 
     record.node.removeAttribute("data-slimgpt-collapsed");
