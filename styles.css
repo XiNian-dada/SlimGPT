@@ -1,0 +1,175 @@
+.slimgpt-placeholder {
+  display: block;
+  width: 100%;
+  min-height: 24px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+#slimgpt-minimap {
+  position: fixed;
+  top: 56px;
+  bottom: 56px;
+  /* Sit just to the right of ChatGPT's sidebar (~260px wide).
+     We use a CSS var with fallback so it's easy to tweak. */
+  left: var(--slimgpt-sidebar-width, 268px);
+  width: 22px;
+  z-index: 2147483646;
+  pointer-events: none;
+}
+
+.slimgpt-minimap-track {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  border-radius: 7px;
+  background: rgba(128, 128, 128, 0.12);
+  pointer-events: auto;
+}
+
+.slimgpt-minimap-dot {
+  position: absolute;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 20px;
+  height: 20px;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  cursor: pointer;
+  padding: 0;
+  opacity: 0;
+  will-change: top, opacity;
+  /* Apple-like smooth drift when the visible minimap window moves */
+  transition: top 0.3s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.16s ease;
+}
+
+.slimgpt-minimap-dot::before {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 8px;
+  height: 8px;
+  transform: translate(-50%, -50%);
+  border-radius: 50%;
+  background: rgba(120, 120, 120, 0.75);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.18);
+  transition: width 0.12s ease, height 0.12s ease, background 0.12s ease, box-shadow 0.12s ease;
+}
+
+.slimgpt-minimap-dot.is-entered {
+  opacity: 1;
+}
+
+.slimgpt-minimap-dot.is-exiting {
+  opacity: 0;
+}
+
+.slimgpt-minimap-dot:hover::before {
+  width: 10px;
+  height: 10px;
+  background: #555;
+}
+
+.slimgpt-minimap-dot.is-active::before {
+  width: 12px;
+  height: 12px;
+  background: #22c55e;
+  box-shadow: 0 0 0 2px rgba(34, 197, 94, 0.45);
+  animation: slimgpt-dot-breathe 2.3s ease-in-out infinite;
+}
+
+.slimgpt-minimap-dot.is-active-pulse::before {
+  animation: slimgpt-dot-pulse 380ms ease-out, slimgpt-dot-breathe 2.3s 380ms ease-in-out infinite;
+}
+
+@keyframes slimgpt-dot-pulse {
+  0% {
+    transform: translate(-50%, -50%) scale(0.9);
+    box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.65);
+  }
+
+  65% {
+    transform: translate(-50%, -50%) scale(1.15);
+    box-shadow: 0 0 0 8px rgba(34, 197, 94, 0);
+  }
+
+  100% {
+    transform: translate(-50%, -50%) scale(1);
+    box-shadow: 0 0 0 2px rgba(34, 197, 94, 0.45);
+  }
+}
+
+@keyframes slimgpt-dot-breathe {
+  0% {
+    transform: translate(-50%, -50%) scale(1);
+    box-shadow: 0 0 0 2px rgba(34, 197, 94, 0.34);
+  }
+
+  50% {
+    transform: translate(-50%, -50%) scale(1.08);
+    box-shadow: 0 0 0 5px rgba(34, 197, 94, 0.16);
+  }
+
+  100% {
+    transform: translate(-50%, -50%) scale(1);
+    box-shadow: 0 0 0 2px rgba(34, 197, 94, 0.34);
+  }
+}
+
+/* Hover preview tooltip */
+.slimgpt-dot-preview {
+  position: fixed;
+  max-width: 320px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  background: rgba(24, 24, 24, 0.94);
+  color: #f4f4f4;
+  font-size: 12px;
+  line-height: 1.45;
+  pointer-events: none;
+  z-index: 2147483647;
+  white-space: normal;
+  word-break: break-word;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  backdrop-filter: blur(4px);
+  opacity: 0;
+  transform: translateY(3px);
+  transition: opacity 0.14s ease, transform 0.14s ease;
+}
+
+.slimgpt-dot-preview.is-visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.slimgpt-dot-preview-row {
+  margin: 0 0 6px;
+}
+
+.slimgpt-dot-preview-row:last-child {
+  margin-bottom: 0;
+}
+
+.slimgpt-dot-preview-label {
+  color: #8bd4ff;
+  font-weight: 600;
+}
+
+.slimgpt-dot-preview-text {
+  color: #f4f4f4;
+}
+
+@media (max-width: 640px) {
+  #slimgpt-minimap {
+    top: 84px;
+    bottom: 32px;
+    left: 4px;
+  }
+
+  .slimgpt-dot-preview {
+    max-width: min(260px, calc(100vw - 36px));
+  }
+}

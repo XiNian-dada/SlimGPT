@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "SlimGPT",
+  "version": "1.0.0",
+  "description": "SlimGPT — Make ChatGPT fast again. Automatically collapse old messages in long chats.",
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "css": [
+        "styles.css"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+name: Package Extension
+
+on:
+  push:
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build zip package
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          ZIP_NAME="slimgpt-${SHORT_SHA}.zip"
+          zip -r "$ZIP_NAME" manifest.json content.js styles.css
+          echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ env.ZIP_NAME }}
