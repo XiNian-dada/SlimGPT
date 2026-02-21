@@ -7,15 +7,18 @@
     userRole: "user",
     assistantRole: "assistant",
     turnsAroundViewport: 3,
-    maxTurnsAroundViewportFastScroll: 20,
+    maxTurnsAroundViewportFastScroll: 36,
+    jumpPreloadTurns: 56,
     minimapVisibleDots: 20,
-    minimapThrottleMs: 90,
+    minimapThrottleMs: 140,
+    typingMinimapThrottleMs: 260,
     fastScrollWindowMs: 220,
-    collapseOpsPerFrame: 8,
-    collapsePauseAfterScrollMs: 220,
-    modelRebuildMinIntervalMs: 140,
+    collapseOpsPerFrame: 4,
+    collapsePauseAfterScrollMs: 650,
+    modelRebuildMinIntervalMs: 220,
     pinToBottomThresholdPx: 260,
-    startupCollapseDelayMs: 600,
+    startupCollapseDelayMs: 900,
+    typingHotMs: 1300,
     maxSnippetLength: 120,
     minPlaceholderHeight: 24
   };
@@ -28,11 +31,17 @@
     modelDirty: true,
     nextModelBuildAt: 0,
     modelBuildTimer: 0,
+    typingSyncTimer: 0,
     lastUrl: location.href,
     lastScrollAt: 0,
+    lastInputAt: 0,
+    inputFocused: false,
+    composing: false,
     allowCollapseAt: performance.now() + CONFIG.startupCollapseDelayMs,
 
     scrollRoot: null,
+    domObserver: null,
+    observedRoot: null,
     messages: [],
     messageById: new Map(),
     turnToIds: new Map(),
@@ -43,6 +52,7 @@
     lastMiniMapSignature: "",
     lastMiniMapRenderAt: 0,
     minimapDeferredTimer: 0,
+    typingSyncDueAt: 0,
 
     collapsedById: new Map(),
     collapseTargetRange: null,
@@ -67,6 +77,10 @@
       clearTimeout(STATE.minimapDeferredTimer);
       STATE.minimapDeferredTimer = 0;
     }
+    if (STATE.typingSyncTimer !== 0) {
+      clearTimeout(STATE.typingSyncTimer);
+      STATE.typingSyncTimer = 0;
+    }
     STATE.lastMiniMapSignature = "";
     STATE.lastMiniMapAnchorTurn = -1;
     STATE.lastMiniMapRenderAt = 0;
@@ -80,15 +94,199 @@
       "scroll",
       () => {
         STATE.lastScrollAt = Date.now();
+        if (isTypingHot()) {
+          return;
+        }
         scheduleSync();
       },
       { passive: true, capture: true }
     );
+
+    document.addEventListener(
+      "keydown",
+      (event) => {
+        if (!(event.target instanceof Element)) {
+          return;
+        }
+
+        if (!isEditableTarget(event.target)) {
+          return;
+        }
+
+        markTypingActivity();
+      },
+      { capture: true }
+    );
+
+    document.addEventListener(
+      "input",
+      (event) => {
+        if (!(event.target instanceof Element)) {
+          return;
+        }
+
+        if (!isEditableTarget(event.target)) {
+          return;
+        }
+
+        markTypingActivity();
+      },
+      { capture: true }
+    );
+
+    document.addEventListener(
+      "focusin",
+      (event) => {
+        if (!(event.target instanceof Element)) {
+          return;
+        }
+
+        if (!isEditableTarget(event.target)) {
+          return;
+        }
+
+        STATE.inputFocused = true;
+      },
+      { capture: true }
+    );
+
+    document.addEventListener(
+      "focusout",
+      (event) => {
+        if (!(event.target instanceof Element)) {
+          return;
+        }
+
+        if (!isEditableTarget(event.target)) {
+          return;
+        }
+
+        STATE.inputFocused = false;
+        STATE.composing = false;
+      },
+      { capture: true }
+    );
+
+    document.addEventListener(
+      "compositionstart",
+      (event) => {
+        if (!(event.target instanceof Element)) {
+          return;
+        }
+
+        if (!isEditableTarget(event.target)) {
+          return;
+        }
+
+        STATE.composing = true;
+        markTypingActivity();
+      },
+      { capture: true }
+    );
+
+    document.addEventListener(
+      "compositionend",
+      (event) => {
+        if (!(event.target instanceof Element)) {
+          return;
+        }
+
+        if (!isEditableTarget(event.target)) {
+          return;
+        }
+
+        STATE.composing = false;
+        markTypingActivity();
+      },
+      { capture: true }
+    );
+  }
+
+  function markTypingActivity() {
+    STATE.inputFocused = true;
+    STATE.lastInputAt = Date.now();
+    STATE.allowCollapseAt = performance.now() + CONFIG.typingHotMs;
+
+    // Keep only one pending sync and move it after the latest keystroke.
+    if (STATE.modelDirty || STATE.typingSyncTimer !== 0) {
+      scheduleSyncAfterTyping(true);
+    }
+  }
+
+  function isEditableTarget(target) {
+    if (!(target instanceof Element)) {
+      return false;
+    }
+
+    if (target.closest("[data-slimgpt-minimap]") || target.closest("[data-slimgpt-preview]")) {
+      return false;
+    }
+
+    if (target instanceof HTMLTextAreaElement) {
+      return true;
+    }
+
+    if (target instanceof HTMLInputElement) {
+      const type = (target.type || "").toLowerCase();
+      return type === "text" || type === "search";
+    }
+
+    if (target instanceof HTMLElement && target.isContentEditable) {
+      return true;
+    }
+
+    const editableAncestor = target.closest("[contenteditable='true'], textarea, input[type='text'], input[type='search']");
+    return editableAncestor instanceof Element;
+  }
+
+  function isTypingHot() {
+    if (STATE.composing) {
+      return true;
+    }
+
+    if (!STATE.inputFocused) {
+      return false;
+    }
+
+    return Date.now() - STATE.lastInputAt < CONFIG.typingHotMs;
+  }
+
+  function scheduleSyncAfterTyping(resetTimer = true) {
+    const idleFor = Date.now() - STATE.lastInputAt;
+    const wait = Math.max(120, CONFIG.typingHotMs - idleFor);
+    const dueAt = performance.now() + wait;
+
+    if (STATE.typingSyncTimer !== 0) {
+      if (!resetTimer && dueAt >= STATE.typingSyncDueAt - 16) {
+        return;
+      }
+
+      clearTimeout(STATE.typingSyncTimer);
+    }
+
+    STATE.typingSyncDueAt = dueAt;
+    STATE.typingSyncTimer = window.setTimeout(() => {
+      STATE.typingSyncTimer = 0;
+      STATE.typingSyncDueAt = 0;
+      scheduleSync();
+    }, wait);
   }
 
   function observeDomChanges() {
-    const observer = new MutationObserver(() => {
+    STATE.domObserver = new MutationObserver((records) => {
       if (STATE.observerMuted) {
+        return;
+      }
+
+      const typingHot = isTypingHot();
+      if (typingHot) {
+        // Input responsiveness first: defer all structure checks until typing cools down.
+        STATE.modelDirty = true;
+        scheduleSyncAfterTyping(false);
+        return;
+      }
+
+      if (!hasStructuralMutation(records)) {
         return;
       }
 
@@ -110,11 +308,90 @@
       STATE.modelDirty = true;
       scheduleSync();
     });
+    refreshObserverTarget();
+  }
 
-    observer.observe(document.documentElement, {
+  function refreshObserverTarget() {
+    if (!(STATE.domObserver instanceof MutationObserver)) {
+      return;
+    }
+
+    const target = resolveObserverTarget();
+    if (!(target instanceof Element)) {
+      return;
+    }
+
+    if (STATE.observedRoot === target) {
+      return;
+    }
+
+    STATE.domObserver.disconnect();
+    STATE.domObserver.observe(target, {
       childList: true,
       subtree: true
     });
+    STATE.observedRoot = target;
+  }
+
+  function resolveObserverTarget() {
+    const sample = document.querySelector(CONFIG.messageSelector);
+    if (sample instanceof HTMLElement) {
+      const messageRoot = getMessageRoot(sample);
+      if (messageRoot instanceof HTMLElement) {
+        const scrollable = findScrollableAncestor(messageRoot);
+        if (scrollable) {
+          return scrollable;
+        }
+
+        const main = messageRoot.closest("main");
+        if (main instanceof HTMLElement) {
+          return main;
+        }
+      }
+    }
+
+    const main = document.querySelector("main");
+    if (main instanceof HTMLElement) {
+      return main;
+    }
+
+    return document.body || document.documentElement;
+  }
+
+  function hasStructuralMutation(records) {
+    for (const record of records) {
+      if (!record || record.type !== "childList") {
+        continue;
+      }
+
+      if (mutationNodeListHasTrackedMessage(record.addedNodes)) {
+        return true;
+      }
+
+      if (mutationNodeListHasTrackedMessage(record.removedNodes)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  function mutationNodeListHasTrackedMessage(nodeList) {
+    for (const node of nodeList) {
+      if (!(node instanceof Element)) {
+        continue;
+      }
+
+      if (node.matches(CONFIG.messageSelector) || node.matches(CONFIG.placeholderSelector)) {
+        return true;
+      }
+
+      if (node.querySelector(CONFIG.messageSelector) || node.querySelector(CONFIG.placeholderSelector)) {
+        return true;
+      }
+    }
+
+    return false;
   }
 
   function observeUrlChanges() {
@@ -130,6 +407,11 @@
         clearTimeout(STATE.modelBuildTimer);
         STATE.modelBuildTimer = 0;
       }
+      if (STATE.typingSyncTimer !== 0) {
+        clearTimeout(STATE.typingSyncTimer);
+        STATE.typingSyncTimer = 0;
+      }
+      STATE.typingSyncDueAt = 0;
       STATE.nextModelBuildAt = 0;
       STATE.currentAnchorTurn = 0;
       STATE.previousAnchorTurn = 0;
@@ -143,8 +425,13 @@
       STATE.collapseTargetRange = null;
       STATE.collapsePlan = null;
       STATE.allowCollapseAt = performance.now() + CONFIG.startupCollapseDelayMs;
+      STATE.lastInputAt = 0;
+      STATE.inputFocused = false;
+      STATE.composing = false;
+      STATE.observedRoot = null;
 
       restoreAllCollapsedMessages();
+      refreshObserverTarget();
       scheduleSync();
     }, 900);
   }
@@ -164,7 +451,15 @@
   function sync() {
     ensureMiniMap();
 
+    const typingHot = isTypingHot();
+    const scrollingHot = Date.now() - STATE.lastScrollAt < CONFIG.fastScrollWindowMs;
+
     if (STATE.modelDirty) {
+      if (typingHot && !scrollingHot) {
+        scheduleSyncAfterTyping(false);
+        return;
+      }
+
       rebuildModel();
     }
 
@@ -184,14 +479,23 @@
       return;
     }
 
+    if (typingHot && !scrollingHot) {
+      // Typing has highest priority: avoid heavy turn-window recompute while user is entering text.
+      scheduleSyncAfterTyping(false);
+      return;
+    }
+
     const anchorTurn = findAnchorTurn();
     const anchorDelta = Math.abs(anchorTurn - STATE.currentAnchorTurn);
     STATE.previousAnchorTurn = STATE.currentAnchorTurn;
     STATE.currentAnchorTurn = anchorTurn;
 
     const dynamicTurnsAround = getDynamicTurnsAroundViewport(anchorDelta);
-    const minTurn = clamp(anchorTurn - dynamicTurnsAround, 0, STATE.totalTurns - 1);
-    const maxTurn = clamp(anchorTurn + dynamicTurnsAround, 0, STATE.totalTurns - 1);
+    const effectiveTurnsAround = STATE.inputFocused
+      ? Math.min(dynamicTurnsAround, 2)
+      : dynamicTurnsAround;
+    const minTurn = clamp(anchorTurn - effectiveTurnsAround, 0, STATE.totalTurns - 1);
+    const maxTurn = clamp(anchorTurn + effectiveTurnsAround, 0, STATE.totalTurns - 1);
 
     // Critical path: restore around viewport immediately.
     restoreTurnsImmediately(minTurn, maxTurn);
@@ -288,6 +592,7 @@
 
     STATE.totalTurns = Math.max(0, turn + 1);
     resolveScrollRoot(sampleRoot);
+    refreshObserverTarget();
 
     if (STATE.totalTurns === 0) {
       STATE.currentAnchorTurn = 0;
@@ -355,6 +660,10 @@
   }
 
   function requestBackgroundCollapse(minTurn, maxTurn) {
+    if (isTypingHot()) {
+      return;
+    }
+
     const target = {
       min: minTurn,
       max: maxTurn,
@@ -377,6 +686,12 @@
   function collapseWorkerTick() {
     if (STATE.mode !== "dynamic") {
       STATE.collapseWorkerRunning = false;
+      return;
+    }
+
+    if (isTypingHot()) {
+      STATE.collapseWorkerRunning = false;
+      scheduleSyncAfterTyping(false);
       return;
     }
 
@@ -578,16 +893,12 @@
 
     const viewport = getViewportRect();
     const centerX = Math.floor(viewport.left + viewport.width * 0.5);
-    const centerY = Math.floor(viewport.top + viewport.height * 0.5);
-
-    const hitNode = document.elementFromPoint(centerX, centerY);
-    if (hitNode instanceof HTMLElement) {
-      const itemNode = hitNode.closest("[data-slimgpt-item='1']");
-      if (itemNode instanceof HTMLElement) {
-        const turn = Number.parseInt(itemNode.getAttribute("data-slimgpt-turn") || "", 10);
-        if (Number.isFinite(turn)) {
-          return clamp(turn, 0, STATE.totalTurns - 1);
-        }
+    const ySamples = [0.5, 0.35, 0.65, 0.2, 0.8];
+    for (const ratio of ySamples) {
+      const y = Math.floor(viewport.top + viewport.height * ratio);
+      const hitTurn = findTurnFromPoint(centerX, y);
+      if (hitTurn >= 0) {
+        return hitTurn;
       }
     }
 
@@ -595,6 +906,25 @@
     const ratio = clamp(getScrollTop() / scrollRange, 0, 1);
 
     return clamp(Math.round(ratio * (STATE.totalTurns - 1)), 0, STATE.totalTurns - 1);
+  }
+
+  function findTurnFromPoint(x, y) {
+    const hitNode = document.elementFromPoint(x, y);
+    if (!(hitNode instanceof HTMLElement)) {
+      return -1;
+    }
+
+    const itemNode = hitNode.closest("[data-slimgpt-item='1']");
+    if (!(itemNode instanceof HTMLElement)) {
+      return -1;
+    }
+
+    const turn = Number.parseInt(itemNode.getAttribute("data-slimgpt-turn") || "", 10);
+    if (!Number.isFinite(turn)) {
+      return -1;
+    }
+
+    return clamp(turn, 0, STATE.totalTurns - 1);
   }
 
   function getViewportRect() {
@@ -804,12 +1134,14 @@
     }
 
     const now = performance.now();
+    const typingHot = isTypingHot();
     const scrollingHot = Date.now() - STATE.lastScrollAt < CONFIG.fastScrollWindowMs;
-    if (!force && scrollingHot && now - STATE.lastMiniMapRenderAt < CONFIG.minimapThrottleMs) {
+    const throttleMs = typingHot ? CONFIG.typingMinimapThrottleMs : CONFIG.minimapThrottleMs;
+    if (!force && (scrollingHot || typingHot) && now - STATE.lastMiniMapRenderAt < throttleMs) {
       if (STATE.minimapDeferredTimer === 0) {
         const wait = Math.max(
           16,
-          Math.ceil(CONFIG.minimapThrottleMs - (now - STATE.lastMiniMapRenderAt))
+          Math.ceil(throttleMs - (now - STATE.lastMiniMapRenderAt))
         );
         STATE.minimapDeferredTimer = window.setTimeout(() => {
           STATE.minimapDeferredTimer = 0;
@@ -922,8 +1254,8 @@
     STATE.currentAnchorTurn = turn;
     STATE.previousAnchorTurn = turn;
 
-    const minTurn = clamp(turn - CONFIG.maxTurnsAroundViewportFastScroll, 0, STATE.totalTurns - 1);
-    const maxTurn = clamp(turn + CONFIG.maxTurnsAroundViewportFastScroll, 0, STATE.totalTurns - 1);
+    const minTurn = clamp(turn - CONFIG.jumpPreloadTurns, 0, STATE.totalTurns - 1);
+    const maxTurn = clamp(turn + CONFIG.jumpPreloadTurns, 0, STATE.totalTurns - 1);
 
     restoreTurnsImmediately(minTurn, maxTurn);
     requestBackgroundCollapse(minTurn, maxTurn);
