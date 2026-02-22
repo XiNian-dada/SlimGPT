@@ -1183,6 +1183,22 @@
     const track = document.createElement("div");
     track.className = "slimgpt-minimap-track";
 
+    const actions = document.createElement("div");
+    actions.className = "slimgpt-minimap-actions";
+
+    const exportBtn = document.createElement("button");
+    exportBtn.type = "button";
+    exportBtn.className = "slimgpt-minimap-action";
+    exportBtn.setAttribute("data-slimgpt-export", "1");
+    exportBtn.setAttribute("aria-label", "Export chat as JSON");
+    exportBtn.textContent = "JSON";
+    exportBtn.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      exportChatAsJson();
+    });
+    actions.appendChild(exportBtn);
+
     const preview = document.createElement("div");
     preview.className = "slimgpt-dot-preview";
     preview.setAttribute("data-slimgpt-preview", "1");
@@ -1271,6 +1287,7 @@
     });
 
     minimap.appendChild(track);
+    minimap.appendChild(actions);
     document.body.appendChild(minimap);
     document.body.appendChild(preview);
   }
@@ -1402,6 +1419,253 @@
     }
 
     return dots;
+  }
+
+  function exportChatAsJson() {
+    if (!isConversationPage()) {
+      return;
+    }
+
+    if (STATE.modelDirty && !isTypingHot()) {
+      rebuildModel();
+    }
+
+    const payload = buildExportPayload();
+    if (!payload) {
+      return;
+    }
+
+    const filename = buildExportFilename(payload);
+    downloadJson(payload, filename);
+  }
+
+  function buildExportPayload() {
+    const title = getConversationTitle();
+    const exportedAt = new Date().toISOString();
+    const url = location.href;
+
+    if (!Array.isArray(STATE.messages) || STATE.messages.length === 0) {
+      return {
+        exporter: "SlimGPT",
+        format: "slimgpt-chat-json",
+        exportedAt,
+        title,
+        url,
+        totalTurns: 0,
+        totalMessages: 0,
+        turns: []
+      };
+    }
+
+    const ordered = STATE.messages
+      .map((item, index) => ({ item, index }))
+      .sort((a, b) => {
+        if (a.item.turnIndex !== b.item.turnIndex) {
+          return a.item.turnIndex - b.item.turnIndex;
+        }
+        return a.index - b.index;
+      });
+
+    const turns = [];
+    const turnMap = new Map();
+
+    let sequence = 0;
+    for (const entry of ordered) {
+      const item = entry.item;
+      if (!item) continue;
+      const message = buildExportMessage(item, sequence);
+      sequence += 1;
+
+      let turn = turnMap.get(item.turnIndex);
+      if (!turn) {
+        turn = {
+          turnIndex: item.turnIndex,
+          messages: []
+        };
+        turnMap.set(item.turnIndex, turn);
+        turns.push(turn);
+      }
+      turn.messages.push(message);
+    }
+
+    return {
+      exporter: "SlimGPT",
+      format: "slimgpt-chat-json",
+      exportedAt,
+      title,
+      url,
+      totalTurns: STATE.totalTurns,
+      totalMessages: sequence,
+      turns
+    };
+  }
+
+  function buildExportMessage(item, sequence) {
+    const root = getExportRootForItem(item);
+    const meta = extractExportMeta(root, item);
+    const textInfo = extractExportText(root, item);
+
+    return {
+      sequence,
+      turnIndex: item.turnIndex,
+      role: item.role,
+      slimgptId: item.id,
+      messageId: meta.messageId,
+      turnId: meta.turnId,
+      model: meta.model,
+      text: textInfo.text,
+      isPlaceholder: !!item.isPlaceholder,
+      isTruncated: textInfo.isTruncated,
+      source: textInfo.source
+    };
+  }
+
+  function getExportRootForItem(item) {
+    if (!item) {
+      return null;
+    }
+
+    if (item.isPlaceholder) {
+      const record = STATE.collapsedById.get(item.id);
+      if (record && record.node instanceof HTMLElement) {
+        return record.node;
+      }
+    }
+
+    if (item.el instanceof HTMLElement) {
+      return item.el;
+    }
+
+    return null;
+  }
+
+  function extractExportMeta(root, item) {
+    let messageId = "";
+    let turnId = "";
+    let model = "";
+
+    if (root instanceof HTMLElement) {
+      turnId = root.getAttribute("data-turn-id") || "";
+
+      const msgNode = root.querySelector("[data-message-author-role]");
+      if (msgNode instanceof HTMLElement) {
+        messageId = msgNode.getAttribute("data-message-id") || "";
+        model = msgNode.getAttribute("data-message-model-slug") || "";
+      }
+    }
+
+    if (!turnId && item && item.el instanceof HTMLElement) {
+      turnId = item.el.getAttribute("data-turn-id") || "";
+    }
+
+    return { messageId, turnId, model };
+  }
+
+  function extractExportText(root, item) {
+    if (root instanceof HTMLElement) {
+      const text = normalizeExportText(extractTextFromRoot(root));
+      if (text) {
+        return { text, isTruncated: false, source: "full" };
+      }
+    }
+
+    const snippet = item?.snippet || "";
+    if (snippet) {
+      return { text: snippet, isTruncated: true, source: "snippet" };
+    }
+
+    return { text: "", isTruncated: false, source: "empty" };
+  }
+
+  function extractTextFromRoot(root) {
+    try {
+      const clone = root.cloneNode(true);
+      if (!(clone instanceof HTMLElement)) {
+        return root.textContent || "";
+      }
+
+      clone.querySelectorAll(
+        ".sr-only, button, svg, path, use, script, style, noscript"
+      ).forEach((el) => el.remove());
+
+      const messageNode = clone.querySelector("[data-message-author-role]");
+      const target = messageNode || clone;
+      return target.textContent || "";
+    } catch {
+      return root.textContent || "";
+    }
+  }
+
+  function normalizeExportText(text) {
+    if (!text) {
+      return "";
+    }
+
+    return String(text)
+      .replace(/\r\n/g, "\n")
+      .replace(/\u00a0/g, " ")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+  }
+
+  function getConversationTitle() {
+    const title = document.title || "";
+    if (title && title.toLowerCase() !== "chatgpt") {
+      return title.trim();
+    }
+
+    const headerTitle = document.querySelector("h1, h2");
+    if (headerTitle instanceof HTMLElement) {
+      const text = headerTitle.textContent || "";
+      if (text.trim()) {
+        return text.trim();
+      }
+    }
+
+    return "chatgpt";
+  }
+
+  function buildExportFilename(payload) {
+    const stamp = formatDateForFilename(new Date());
+    const title = sanitizeFilename(payload?.title || "chatgpt");
+    return `slimgpt-${stamp}-${title}.json`;
+  }
+
+  function formatDateForFilename(date) {
+    const pad = (num) => String(num).padStart(2, "0");
+    return [
+      date.getFullYear(),
+      pad(date.getMonth() + 1),
+      pad(date.getDate())
+    ].join("") + "-" + [
+      pad(date.getHours()),
+      pad(date.getMinutes()),
+      pad(date.getSeconds())
+    ].join("");
+  }
+
+  function sanitizeFilename(text) {
+    const value = String(text || "chatgpt").trim() || "chatgpt";
+    return value.replace(/[\\/:*?"<>|]+/g, "_").slice(0, 80);
+  }
+
+  function downloadJson(payload, filename) {
+    const json = JSON.stringify(payload, null, 2);
+    const blob = new Blob([json], { type: "application/json;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    link.style.position = "fixed";
+    link.style.left = "-9999px";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+
+    window.setTimeout(() => {
+      URL.revokeObjectURL(url);
+    }, 1000);
   }
 
   function jumpToTurn(turnIndex) {

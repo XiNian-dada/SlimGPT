@@ -16,15 +16,50 @@
   width: 22px;
   z-index: 2147483646;
   pointer-events: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 0;
 }
 
 .slimgpt-minimap-track {
   position: relative;
   width: 100%;
   height: 100%;
+  flex: 1 1 auto;
   border-radius: 7px;
   background: rgba(128, 128, 128, 0.12);
   pointer-events: auto;
+}
+
+.slimgpt-minimap-actions {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: auto;
+}
+
+.slimgpt-minimap-action {
+  width: 20px;
+  height: 20px;
+  border: 0;
+  border-radius: 6px;
+  background: rgba(140, 140, 140, 0.18);
+  color: rgba(245, 245, 245, 0.9);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  padding: 0;
+  transition: background 0.12s ease, color 0.12s ease, transform 0.12s ease;
+}
+
+.slimgpt-minimap-action:hover {
+  background: rgba(170, 170, 170, 0.25);
+  color: #fff;
+  transform: translateY(-1px);
 }
 
 .slimgpt-minimap-dot {
