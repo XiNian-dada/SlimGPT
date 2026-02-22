@@ -1,83 +1,121 @@
 # SlimGPT
 
-**Make ChatGPT fast again.** A Chrome / Edge extension that keeps long conversations responsive by dynamically managing the DOM.
+SlimGPT 是一个 Chrome / Edge Manifest V3 扩展，目标是让 ChatGPT 在超长对话里依然保持流畅。
 
-## Why it exists
+核心思路：只做减法，只操作 DOM，不碰 ChatGPT 内部 React 状态。
 
-ChatGPT renders every message as a full React subtree. In a long conversation this means hundreds of deeply nested DOM nodes all participating in layout, scroll, and re-render — even the ones you scrolled past an hour ago. The page gets progressively slower as the conversation grows.
+## 解决的问题
 
-SlimGPT fixes this with one idea: **only keep the messages near your viewport alive in the DOM. Everything else becomes a lightweight placeholder.**
+长对话中 ChatGPT 会累积大量消息节点，导致：
 
-## How it works
+- 滚动时卡顿
+- 输入框打字变慢
+- 快速跳转体验变差
+- 页面首次进入和刷新变慢
 
-### DOM virtualization via placeholder swap
+SlimGPT 通过“对话虚拟化 + 视口优先恢复 + 后台折叠”降低主线程压力。
 
-When a message scrolls far enough from the viewport, SlimGPT:
+## 主要功能
 
-1. Measures the element's rendered height.
-2. Replaces it in the DOM with an empty `<div>` of the same height (the placeholder). This preserves scroll position and layout.
-3. Detaches the original node from the document, removing its entire subtree from layout and rendering.
+### 1. 动态对话虚拟化（核心）
 
-When you scroll back toward that message, the placeholder is swapped back out for the real node before it enters view.
+- 仅保留视口附近的 turn 为完整 DOM
+- 远离视口的旧消息替换为等高 placeholder
+- 上翻/下翻时自动恢复附近消息
+- 保持滚动高度稳定，不出现跳动
 
-This is done entirely through DOM manipulation — no React state is touched, no ChatGPT internals are accessed.
+### 2. 输入优先策略
 
-### Viewport anchor + priority zones
+- 检测输入焦点、键入、组合输入（IME）
+- 打字期间显著降低折叠/重建预算
+- 避免输入线程被后台 DOM 工作抢占
 
-On every scroll or DOM change, SlimGPT finds the **anchor turn** — the conversation turn closest to the center of the viewport. It then defines two zones around it:
+### 3. Minimap 快速导航
 
-- **Near zone** (±3 turns): restored immediately and synchronously.
-- **Far zone** (±3–12 turns, adaptive): kept alive during fast scrolling, collapsed lazily in the background.
-- **Beyond far zone**: collapsed via a background worker that processes a few nodes per animation frame to avoid jank.
+- 左侧迷你轨道展示对话位置
+- 点击点位可快速跳转到对应 turn
+- 当前视口对应点位高亮（绿色呼吸效果）
+- hover 预览该段上下文摘要（上一个 GPT / 用户 / 下一个 GPT）
 
-During fast scrolling the near zone expands automatically so content is ready before you stop. During typing the collapse budget is reduced to avoid competing with input responsiveness.
+### 4. 行内公式渲染与复制
 
-### MutationObserver for new messages
+- 补渲染 ChatGPT 未处理的 `$...$` 行内公式
+- 使用本地离线 KaTeX（`vendor/katex`），不依赖 CDN
+- 点击公式即可复制对应 TeX
+- 支持增量流式渲染，同时带稳定性节流
 
-A `MutationObserver` watches for new conversation turns being added by ChatGPT's React layer. When a new message appears, the model is rebuilt and the viewport zones are recalculated. Mutations that happen while you're typing are deferred until the keyboard goes idle.
+### 5. 输入框扩展按钮
 
-### Minimap navigation
+- 在 composer 区域注入扩展按钮
+- 一键把输入区高度放大到约 5 倍（受视口上限保护）
+- 回车发送或再次点击可收起
 
-A thin vertical strip sits between the sidebar and the chat content. Each dot represents one conversation turn. Clicking a dot jumps directly to that turn — the extension pre-restores a wide window of turns around the destination before scrolling, so the content is already in the DOM when you arrive.
+### 6. 会话切换与刷新恢复
 
-The active dot (green) shows your current position with a breathing animation. All dots slide smoothly when the visible window shifts.
+- 监听 URL 变化，自动重建模型
+- 刷新后有引导重试机制，避免首次模型为空导致 UI 丢失
 
-### Hover preview
+## 技术特性
 
-Hovering a minimap dot shows a small tooltip with the user message and assistant reply for that turn. If the turn is currently collapsed, it is temporarily restored to read the text, then re-collapsed by the background worker.
+- Manifest V3
+- 纯 Content Script（`content.js` + `styles.css`）
+- 基于 `MutationObserver` 监听消息变化
+- 不写死易碎 class 作为唯一判断依据（优先语义与 data 属性）
+- 无 OpenAI API 调用
+- 不保存用户隐私数据
+- 零配置安装即生效
 
-### Typing protection
+## 项目结构
 
-The extension tracks focus and keystroke timing. While the input box is active and recent keystrokes have been detected, DOM collapse operations are throttled to their minimum budget so the main thread stays free for input handling.
-
-### URL change detection
-
-ChatGPT navigates between conversations without a full page reload. SlimGPT polls `location.href` and resets all state when the URL changes, restoring any collapsed messages before rebuilding the model for the new conversation.
-
-## Features
-
-- Zero configuration — install and it works
-- Dynamically collapses off-screen messages into height-preserving placeholders
-- Adaptive viewport zones that widen during fast scrolling
-- Typing-aware: collapse work pauses while you're writing
-- Minimap with smooth animated dots for quick navigation
-- Hover preview shows conversation content without leaving the minimap
-- No API calls, no account, no cloud, no data collection
-- Pure Content Script — does not modify ChatGPT's JS or React state
-- Manifest V3, works on Chrome and Edge
-
-## Project structure
-
-```
+```text
 SlimGPT/
-├── manifest.json   — extension manifest (MV3)
-├── content.js      — all logic: model, collapse worker, minimap, preview
-└── styles.css      — minimap, placeholder, tooltip styles
+├── manifest.json
+├── content.js
+├── styles.css
+├── vendor/
+│   └── katex/
+│       ├── katex.min.js
+│       ├── katex.min.css
+│       └── fonts/
+└── .github/
+    └── workflows/
+        └── package.yml
 ```
 
-## Install (Chrome / Edge)
+## 安装方式（Chrome / Edge）
 
-1. Open `chrome://extensions` or `edge://extensions`
-2. Enable **Developer mode**
-3. Click **Load unpacked**
-4. Select this folder
+1. 打开 `chrome://extensions` 或 `edge://extensions`
+2. 开启“开发者模式”
+3. 点击“加载已解压的扩展程序”
+4. 选择 SlimGPT 项目根目录
+
+## 开发与调试
+
+- 修改 `content.js` / `styles.css` 后，在扩展管理页点击“重新加载”
+- 在 ChatGPT 页面刷新后验证行为
+- 建议观察以下指标：
+  - 输入延迟
+  - 快速滚动时恢复速度
+  - 长对话内 DOM 数量变化
+  - 控制台是否出现扩展自身报错
+
+## CI 打包
+
+仓库包含 GitHub Actions 工作流：每次 push 自动打包扩展 zip 并上传 artifact。
+
+文件位置：`.github/workflows/package.yml`
+
+## 非目标
+
+- 不改写 prompt
+- 不接 OpenAI API
+- 不做账号体系/云同步
+- 不做复杂设置面板
+
+## 兼容性
+
+- Chrome（Manifest V3）
+- Edge（Manifest V3）
+- 目标站点：
+  - `https://chatgpt.com/*`
+  - `https://chat.openai.com/*`

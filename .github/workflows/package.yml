@@ -15,7 +15,7 @@ jobs:
         run: |
           SHORT_SHA="${GITHUB_SHA::7}"
           ZIP_NAME="slimgpt-${SHORT_SHA}.zip"
-          zip -r "$ZIP_NAME" manifest.json content.js styles.css
+          zip -r "$ZIP_NAME" manifest.json content.js styles.css vendor
           echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
 
       - name: Upload artifact

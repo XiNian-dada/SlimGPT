@@ -22,8 +22,21 @@
     collapsePauseAfterScrollMs: 160,
     modelRebuildMinIntervalMs: 220,
     pinToBottomThresholdPx: 260,
-    startupCollapseDelayMs: 160,
+    startupCollapseDelayMs: 1100,
     typingHotMs: 1300,
+    composerExpandFactor: 5,
+    composerExpandViewportCap: 0.8,
+    composerExpandMinExtraPx: 120,
+    inlineLatexDebounceMs: 90,
+    inlineLatexStreamRenderMinIntervalMs: 240,
+    inlineLatexInitialReadyDelayMs: 1200,
+    inlineLatexPostLoadReadyDelayMs: 320,
+    inlineLatexBootstrapScanMs: 700,
+    inlineLatexBootstrapScanMaxRuns: 18,
+    inlineLatexLiveAssistantScanLimit: 28,
+    bootstrapModelRetryMs: 260,
+    bootstrapModelMaxRetries: 70,
+    composerInitDelayMs: 1200,
     maxSnippetLength: 120,
     minPlaceholderHeight: 24
   };
@@ -36,6 +49,8 @@
     modelDirty: true,
     nextModelBuildAt: 0,
     modelBuildTimer: 0,
+    bootstrapSyncTimer: 0,
+    bootstrapSyncAttempts: 0,
     typingSyncTimer: 0,
     lastUrl: location.href,
     lastScrollAt: 0,
@@ -56,6 +71,18 @@
     lastMiniMapRenderAt: 0,
     minimapDeferredTimer: 0,
     typingSyncDueAt: 0,
+    composerInitStarted: false,
+    composerSubmitListenerBound: false,
+    inlineLatexObserver: null,
+    inlineLatexPendingRoots: new Map(),
+    inlineLatexFlushTimer: 0,
+    inlineLatexSafetyTimer: 0,
+    inlineLatexBootstrapTimer: 0,
+    inlineLatexBootstrapRuns: 0,
+    inlineLatexReadyAt: 0,
+    inlineLatexSourceByHost: new WeakMap(),
+    inlineLatexLastRenderAt: new WeakMap(),
+    latexCopyDelegateBound: false,
 
     collapsedById: new Map(),
     heightById: new Map(),
@@ -66,17 +93,27 @@
 
   function init() {
     cleanupLegacyUi();
+    ensureKatexStyles();
     ensureMiniMap();
     bindGlobalListeners();
     observeDomChanges();
     observeUrlChanges();
+    initLatexCopyButtons();
+    initInlineLatexRenderer();
+    initComposerExpand();
     scheduleSync();
+    scheduleBootstrapSync();
   }
 
   function cleanupLegacyUi() {
     document.querySelector("[data-slimgpt-controls]")?.remove();
     document.querySelector("[data-slimgpt-minimap]")?.remove();
     document.querySelector("[data-slimgpt-preview]")?.remove();
+    document.getElementById("slimgpt-katex-js")?.remove();
+    document.getElementById("slimgpt-katex-css")?.remove();
+    document.querySelectorAll("script[src*='cdn.jsdelivr.net/npm/katex'], link[href*='cdn.jsdelivr.net/npm/katex']")
+      .forEach((el) => el.remove());
+    document.querySelectorAll("[data-slimgpt-latex-btn='1'], [data-slimgpt-latex-inline-btn='1']").forEach((el) => el.remove());
     if (STATE.minimapDeferredTimer !== 0) {
       clearTimeout(STATE.minimapDeferredTimer);
       STATE.minimapDeferredTimer = 0;
@@ -85,6 +122,27 @@
       clearTimeout(STATE.typingSyncTimer);
       STATE.typingSyncTimer = 0;
     }
+    if (STATE.bootstrapSyncTimer !== 0) {
+      clearTimeout(STATE.bootstrapSyncTimer);
+      STATE.bootstrapSyncTimer = 0;
+    }
+    if (STATE.inlineLatexSafetyTimer !== 0) {
+      clearInterval(STATE.inlineLatexSafetyTimer);
+      STATE.inlineLatexSafetyTimer = 0;
+    }
+    if (STATE.inlineLatexBootstrapTimer !== 0) {
+      clearInterval(STATE.inlineLatexBootstrapTimer);
+      STATE.inlineLatexBootstrapTimer = 0;
+    }
+    if (STATE.inlineLatexFlushTimer !== 0) {
+      clearTimeout(STATE.inlineLatexFlushTimer);
+      STATE.inlineLatexFlushTimer = 0;
+    }
+    STATE.inlineLatexPendingRoots.clear();
+    STATE.inlineLatexSourceByHost = new WeakMap();
+    STATE.inlineLatexLastRenderAt = new WeakMap();
+    STATE.inlineLatexBootstrapRuns = 0;
+    STATE.bootstrapSyncAttempts = 0;
     STATE.lastMiniMapSignature = "";
     STATE.lastMiniMapAnchorTurn = -1;
     STATE.lastMiniMapRenderAt = 0;
@@ -204,10 +262,19 @@
       },
       { capture: true }
     );
+
+    // Alt+ArrowUp / Alt+ArrowDown: jump between turns without touching the mouse.
+    // Skip when focus is inside an editable so we don't hijack text editing.
+    document.addEventListener("keydown", (event) => {
+      if (!event.altKey || (event.key !== "ArrowUp" && event.key !== "ArrowDown")) return;
+      if (isEditableTarget(event.target)) return;
+      event.preventDefault();
+      const delta = event.key === "ArrowDown" ? 1 : -1;
+      jumpToTurn(STATE.currentAnchorTurn + delta);
+    }, { capture: true });
   }
 
   function markTypingActivity() {
-    STATE.inputFocused = true;
     STATE.lastInputAt = Date.now();
 
     // Keep only one pending sync and move it after the latest keystroke.
@@ -374,8 +441,13 @@
         clearTimeout(STATE.typingSyncTimer);
         STATE.typingSyncTimer = 0;
       }
+      if (STATE.bootstrapSyncTimer !== 0) {
+        clearTimeout(STATE.bootstrapSyncTimer);
+        STATE.bootstrapSyncTimer = 0;
+      }
       STATE.typingSyncDueAt = 0;
       STATE.nextModelBuildAt = 0;
+      STATE.bootstrapSyncAttempts = 0;
       STATE.currentAnchorTurn = 0;
       STATE.previousAnchorTurn = 0;
       STATE.lastMiniMapAnchorTurn = -1;
@@ -391,9 +463,20 @@
       STATE.lastInputAt = 0;
       STATE.inputFocused = false;
       STATE.composing = false;
+      STATE.inlineLatexPendingRoots.clear();
+      STATE.inlineLatexSourceByHost = new WeakMap();
+      STATE.inlineLatexLastRenderAt = new WeakMap();
+      STATE.inlineLatexBootstrapRuns = 0;
+      STATE.inlineLatexReadyAt = performance.now() + CONFIG.inlineLatexPostLoadReadyDelayMs;
+      if (STATE.inlineLatexFlushTimer !== 0) {
+        clearTimeout(STATE.inlineLatexFlushTimer);
+        STATE.inlineLatexFlushTimer = 0;
+      }
+      startInlineLatexBootstrapTimer();
 
       restoreAllCollapsedMessages();
       scheduleSync();
+      scheduleBootstrapSync();
     }, 900);
   }
 
@@ -425,9 +508,11 @@
     }
 
     if (STATE.totalTurns <= 0 || STATE.messages.length === 0) {
+      scheduleBootstrapSync();
       updateMiniMap();
       return;
     }
+    cancelBootstrapSync();
 
     if (STATE.mode === "expanded") {
       restoreAllCollapsedMessages();
@@ -437,6 +522,7 @@
 
       STATE.collapseTargetRange = null;
       updateMiniMap();
+      queueInlineLatexForViewportTurns(2);
       return;
     }
 
@@ -450,6 +536,7 @@
       enforceLiveTurnBudget(anchorTurn, true);
       requestBackgroundCollapse(minTurn, maxTurn);
       updateMiniMap();
+      queueInlineLatexForViewportTurns(2);
       scheduleSyncAfterTyping(false);
       return;
     }
@@ -476,6 +563,7 @@
     requestBackgroundCollapse(minTurn, maxTurn);
 
     updateMiniMap();
+    queueInlineLatexForViewportTurns();
   }
 
   function rebuildModel() {
@@ -577,6 +665,9 @@
     }
 
     cleanupCollapsedRecords();
+    if (STATE.inlineLatexBootstrapRuns < CONFIG.inlineLatexBootstrapScanMaxRuns) {
+      queueInlineLatexForViewportTurns(4, CONFIG.inlineLatexLiveAssistantScanLimit);
+    }
   }
 
   function getMessageRoot(roleNode) {
@@ -877,6 +968,44 @@
 
     item.el = record.node;
     item.isPlaceholder = false;
+
+    // Restored turns are likely to become visible immediately while scrolling/jumping.
+    // Queue inline math render for the restored subtree so old messages render too.
+    queueInlineLatexRender(record.node);
+  }
+
+  function isConversationPage() {
+    return /^\/c\//.test(location.pathname);
+  }
+
+  function scheduleBootstrapSync() {
+    if (!isConversationPage()) {
+      return;
+    }
+
+    if (STATE.bootstrapSyncAttempts >= CONFIG.bootstrapModelMaxRetries) {
+      return;
+    }
+
+    if (STATE.bootstrapSyncTimer !== 0) {
+      return;
+    }
+
+    STATE.bootstrapSyncTimer = window.setTimeout(() => {
+      STATE.bootstrapSyncTimer = 0;
+      STATE.bootstrapSyncAttempts += 1;
+      STATE.modelDirty = true;
+      scheduleSync();
+    }, CONFIG.bootstrapModelRetryMs);
+  }
+
+  function cancelBootstrapSync() {
+    if (STATE.bootstrapSyncTimer !== 0) {
+      clearTimeout(STATE.bootstrapSyncTimer);
+      STATE.bootstrapSyncTimer = 0;
+    }
+
+    STATE.bootstrapSyncAttempts = 0;
   }
 
   function restoreAllCollapsedMessages() {
@@ -1210,9 +1339,13 @@
     for (let index = 0; index < visible; index += 1) {
       const dot = dots[index];
       const turn = start + index;
-      const slot = visible === 1 ? 0.5 : index / (visible - 1);
+      // 8%–92% keeps dots away from track edges for visual breathing room.
+      const raw = visible === 1 ? 0.5 : index / (visible - 1);
+      const slot = 0.08 + raw * 0.84;
       const topPct = `${slot * 100}%`;
       const isActive = turn === STATE.currentAnchorTurn;
+      // A turn is collapsed when ALL its messages are placeholders.
+      const isCollapsed = isTurnCollapsed(turn);
 
       if (dot.style.top !== topPct) {
         dot.style.top = topPct;
@@ -1234,6 +1367,7 @@
 
       const wasActive = dot.classList.contains("is-active");
       dot.classList.toggle("is-active", isActive);
+      dot.classList.toggle("is-collapsed", isCollapsed && !isActive);
       const allowPulse = Date.now() - STATE.lastScrollAt > CONFIG.fastScrollWindowMs;
 
       if (isActive && !wasActive && STATE.lastMiniMapAnchorTurn !== -1 && allowPulse) {
@@ -1529,8 +1663,944 @@
     return `${text.slice(0, maxLength)}...`;
   }
 
+  // A turn is considered collapsed when every message in it is a placeholder.
+  function isTurnCollapsed(turn) {
+    const ids = STATE.turnToIds.get(turn);
+    if (!ids || ids.length === 0) return false;
+    return ids.every(id => {
+      const item = STATE.messageById.get(id);
+      return item && item.isPlaceholder;
+    });
+  }
+
+  // ── LaTeX copy interaction ───────────────────────────────────────────────────
+  // ChatGPT renders KaTeX into <annotation encoding="application/x-tex">.
+  // We bind copy-on-click directly on the rendered formula for cleaner UI.
+
+  function initLatexCopyButtons() {
+    ensureLatexCopyDelegate();
+
+    // Inject buttons into any math already on the page, then watch for new ones.
+    document.querySelectorAll("annotation[encoding='application/x-tex']")
+      .forEach(injectLatexCopyBtn);
+
+    const obs = new MutationObserver((records) => {
+      for (const r of records) {
+        for (const node of r.addedNodes) {
+          if (!(node instanceof Element)) continue;
+          node.querySelectorAll("annotation[encoding='application/x-tex']")
+            .forEach(injectLatexCopyBtn);
+          if (node.matches("annotation[encoding='application/x-tex']")) {
+            injectLatexCopyBtn(node);
+          }
+        }
+      }
+    });
+    obs.observe(document.body, { childList: true, subtree: true });
+  }
+
+  function injectLatexCopyBtn(annotation) {
+    const displayContainer = annotation.closest(".katex-display");
+    const container = displayContainer || annotation.closest(".katex");
+    if (!container) return;
+
+    const latex = annotation.textContent.trim();
+    if (!latex) return;
+
+    if (container.closest("[data-slimgpt-inline-math='1']")) {
+      return;
+    }
+
+    if (displayContainer) {
+      container.querySelectorAll("[data-slimgpt-latex-btn='1']").forEach((el) => el.remove());
+      bindLatexCopyTarget(container, latex);
+      return;
+    }
+
+    const next = container.nextElementSibling;
+    if (next instanceof HTMLElement && next.getAttribute("data-slimgpt-latex-inline-btn") === "1") {
+      next.remove();
+    }
+    bindLatexCopyTarget(container, latex);
+  }
+
+  function bindLatexCopyTarget(target, latex) {
+    if (!(target instanceof HTMLElement)) {
+      return;
+    }
+
+    const value = String(latex || "").trim();
+    if (!value) {
+      return;
+    }
+
+    target.setAttribute("data-slimgpt-latex-copy", "1");
+    target.setAttribute("data-slimgpt-latex-source", value);
+    target.setAttribute("data-slimgpt-copy-label", "TeX");
+    target.style.cursor = "copy";
+  }
+
+  function ensureLatexCopyDelegate() {
+    if (STATE.latexCopyDelegateBound) {
+      return;
+    }
+
+    document.addEventListener(
+      "click",
+      (event) => {
+        if (!(event.target instanceof Element)) {
+          return;
+        }
+
+        const target = event.target.closest("[data-slimgpt-latex-copy='1']");
+        if (!(target instanceof HTMLElement)) {
+          return;
+        }
+
+        const latex = target.getAttribute("data-slimgpt-latex-source") || "";
+        if (!latex) {
+          return;
+        }
+
+        event.preventDefault();
+        event.stopPropagation();
+
+        copyTextToClipboard(latex).then((ok) => {
+          if (!ok) return;
+          target.classList.add("is-copied");
+          window.setTimeout(() => {
+            target.classList.remove("is-copied");
+          }, 900);
+        });
+      },
+      { capture: true }
+    );
+
+    STATE.latexCopyDelegateBound = true;
+  }
+
+  function copyTextToClipboard(text) {
+    const value = String(text || "");
+    if (!value) {
+      return Promise.resolve(false);
+    }
+
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+      return navigator.clipboard.writeText(value).then(() => true).catch(() => legacyCopy(value));
+    }
+
+    return legacyCopy(value);
+  }
+
+  function legacyCopy(text) {
+    return new Promise((resolve) => {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.setAttribute("readonly", "true");
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      ta.style.pointerEvents = "none";
+      ta.style.left = "-9999px";
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      let ok = false;
+      try {
+        ok = document.execCommand("copy");
+      } catch {
+        ok = false;
+      }
+      ta.remove();
+      resolve(ok);
+    });
+  }
+
+  // ── Composer expand button ───────────────────────────────────────────────────
+  // Injects a resize button into ChatGPT's composer toolbar.
+  // The button expands the textarea to 5× its natural height; clicking again
+  // or sending a message collapses it back.
+
+  function initComposerExpand() {
+    if (STATE.composerInitStarted) {
+      return;
+    }
+
+    STATE.composerInitStarted = true;
+    runAfterWindowLoad(CONFIG.composerInitDelayMs, () => {
+      tryInjectExpandBtn();
+      // Composer may not exist yet on first paint; keep watching for late mounts.
+      const obs = new MutationObserver(() => tryInjectExpandBtn());
+      obs.observe(document.body, { childList: true, subtree: true });
+    });
+
+    if (!STATE.composerSubmitListenerBound) {
+      document.addEventListener(
+        "click",
+        (event) => {
+          if (!(event.target instanceof Element)) return;
+          if (
+            event.target.closest(
+              "[data-testid='send-button'], [aria-label='发送消息'], [aria-label='Send message']"
+            )
+          ) {
+            collapseAllExpandedComposers();
+          }
+        },
+        { capture: true }
+      );
+      STATE.composerSubmitListenerBound = true;
+    }
+  }
+
+  function tryInjectExpandBtn() {
+    const surfaces = document.querySelectorAll("[data-composer-surface='true']");
+    for (const surface of surfaces) {
+      if (!(surface instanceof HTMLElement)) continue;
+
+      const trailing = surface.querySelector("[grid-area='trailing'], .\\[grid-area\\:trailing\\]");
+      if (!(trailing instanceof HTMLElement)) continue;
+      if (trailing.querySelector("[data-slimgpt-expand-btn='1']")) continue;
+
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "slimgpt-expand-btn composer-btn";
+      btn.setAttribute("data-slimgpt-expand-btn", "1");
+      btn.setAttribute("aria-label", "Expand composer");
+      btn.setAttribute("aria-pressed", "false");
+      btn.innerHTML =
+        `<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>`;
+
+      btn.addEventListener("click", () => toggleComposerExpand(btn));
+      trailing.insertBefore(btn, trailing.firstChild);
+
+      if (surface.getAttribute("data-slimgpt-expand-keybound") !== "1") {
+        surface.addEventListener(
+          "keydown",
+          (event) => {
+            if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+              collapseAllExpandedComposers();
+            }
+          },
+          { capture: true }
+        );
+        surface.setAttribute("data-slimgpt-expand-keybound", "1");
+      }
+    }
+  }
+
+  function collapseAllExpandedComposers() {
+    const buttons = document.querySelectorAll("[data-slimgpt-expand-btn='1'][aria-pressed='true']");
+    for (const btn of buttons) {
+      if (btn instanceof HTMLButtonElement) {
+        collapseComposer(btn);
+      }
+    }
+  }
+
+  function toggleComposerExpand(btn) {
+    const expanded = btn.getAttribute("aria-pressed") === "true";
+    expanded ? collapseComposer(btn) : expandComposer(btn);
+  }
+
+  function expandComposer(btn) {
+    const surface = btn.closest("[data-composer-surface='true']");
+    if (!surface) return;
+    setComposerExpandedState(surface, true);
+    const scrollable = findComposerScrollable(surface);
+    if (!scrollable) return;
+
+    const base = getComposerBaseHeight(scrollable);
+    const maxByViewport = Math.floor(window.innerHeight * CONFIG.composerExpandViewportCap);
+    const targetByFactor = Math.round(base * CONFIG.composerExpandFactor);
+    const target = Math.max(
+      base + CONFIG.composerExpandMinExtraPx,
+      Math.min(maxByViewport, targetByFactor)
+    );
+    const extraHeight = Math.max(0, target - base);
+
+    surface.style.setProperty("--deep-research-composer-extra-height", `${extraHeight}px`);
+    scrollable.style.setProperty("max-height", `${target}px`, "important");
+    scrollable.style.setProperty("overflow-y", "auto", "important");
+
+    btn.setAttribute("aria-pressed", "true");
+    btn.setAttribute("aria-label", "Collapse composer");
+    btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="10" y1="14" x2="3" y2="21"/><line x1="21" y1="3" x2="14" y2="10"/></svg>`;
+  }
+
+  function collapseComposer(btn) {
+    const surface = btn.closest("[data-composer-surface='true']");
+    if (!surface) return;
+    setComposerExpandedState(surface, false);
+    const scrollable = findComposerScrollable(surface);
+    if (scrollable) {
+      scrollable.style.removeProperty("max-height");
+      scrollable.style.removeProperty("overflow-y");
+    }
+    surface.style.removeProperty("--deep-research-composer-extra-height");
+
+    btn.setAttribute("aria-pressed", "false");
+    btn.setAttribute("aria-label", "Expand composer");
+    btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>`;
+  }
+
+  function findComposerScrollable(surface) {
+    const direct = surface.querySelector(".wcDTda_prosemirror-parent");
+    if (direct instanceof HTMLElement) {
+      return direct;
+    }
+
+    const prose = surface.querySelector("#prompt-textarea, .ProseMirror");
+    if (prose instanceof HTMLElement) {
+      const container = prose.closest(
+        ".wcDTda_prosemirror-parent, [class*='prosemirror-parent'], [class*='overflow-auto']"
+      );
+      if (container instanceof HTMLElement) {
+        return container;
+      }
+    }
+
+    const fallback = surface.querySelector("[class*='prosemirror-parent'], [class*='overflow-auto']");
+    return fallback instanceof HTMLElement ? fallback : null;
+  }
+
+  function getComposerBaseHeight(scrollable) {
+    const cached = Number.parseFloat(scrollable.getAttribute("data-slimgpt-base-height") || "");
+    if (Number.isFinite(cached) && cached > 0) {
+      return cached;
+    }
+
+    const rectHeight = scrollable.getBoundingClientRect().height;
+    const computed = window.getComputedStyle(scrollable);
+    const computedMax = Number.parseFloat(computed.maxHeight || "");
+    let base = Number.isFinite(rectHeight) && rectHeight > 0 ? rectHeight : 0;
+
+    if (Number.isFinite(computedMax) && computedMax > 0) {
+      base = Math.max(base, computedMax);
+    }
+
+    if (!Number.isFinite(base) || base <= 0) {
+      base = 160;
+    }
+
+    scrollable.setAttribute("data-slimgpt-base-height", String(Math.round(base)));
+    return base;
+  }
+
+  function setComposerExpandedState(surface, expanded) {
+    const form = surface.closest("form");
+    const trailing = surface.querySelector("[grid-area='trailing'], .\\[grid-area\\:trailing\\]");
+
+    if (expanded) {
+      if (form instanceof HTMLFormElement) {
+        form.setAttribute("data-expanded", "true");
+      }
+      surface.setAttribute("data-slimgpt-expanded", "1");
+      surface.style.setProperty(
+        "grid-template-areas",
+        "'header header header' 'primary primary primary' 'leading footer trailing'",
+        "important"
+      );
+      if (trailing instanceof HTMLElement) {
+        trailing.style.setProperty("align-self", "end", "important");
+      }
+      return;
+    }
+
+    if (form instanceof HTMLFormElement) {
+      form.removeAttribute("data-expanded");
+    }
+    surface.removeAttribute("data-slimgpt-expanded");
+    surface.style.removeProperty("grid-template-areas");
+    if (trailing instanceof HTMLElement) {
+      trailing.style.removeProperty("align-self");
+    }
+  }
+
+  function ensureKatexRuntime() {
+    return Promise.resolve(!!(window.katex && typeof window.katex.render === "function"));
+  }
+
+  function ensureKatexStyles() {
+    if (document.getElementById("slimgpt-katex-local-css")) {
+      return;
+    }
+
+    if (!chrome?.runtime?.getURL) {
+      return;
+    }
+
+    const href = chrome.runtime.getURL("vendor/katex/katex.min.css");
+    const link = document.createElement("link");
+    link.id = "slimgpt-katex-local-css";
+    link.rel = "stylesheet";
+    link.href = href;
+    (document.head || document.documentElement).appendChild(link);
+  }
+
   function clamp(value, min, max) {
     return Math.min(max, Math.max(min, value));
+  }
+
+  function runAfterWindowLoad(delayMs, callback) {
+    const run = () => {
+      window.setTimeout(() => {
+        callback();
+      }, Math.max(0, delayMs));
+    };
+
+    if (document.readyState === "complete") {
+      run();
+      return;
+    }
+
+    window.addEventListener("load", run, { once: true });
+  }
+
+  // ── Inline LaTeX renderer ────────────────────────────────────────────────────
+  // ChatGPT sometimes leaves $...$ inline math as raw text instead of rendering
+  // it with KaTeX. We scan assistant message paragraphs and render them ourselves.
+
+  function initInlineLatexRenderer() {
+    ensureKatexStyles();
+    ensureKatexRuntime();
+
+    const now = performance.now();
+    STATE.inlineLatexReadyAt = now + CONFIG.inlineLatexInitialReadyDelayMs;
+    runAfterWindowLoad(CONFIG.inlineLatexPostLoadReadyDelayMs, () => {
+      STATE.inlineLatexReadyAt = Math.min(
+        STATE.inlineLatexReadyAt,
+        performance.now() + CONFIG.inlineLatexPostLoadReadyDelayMs
+      );
+      queueInlineLatexForViewportTurns(4, CONFIG.inlineLatexLiveAssistantScanLimit);
+    });
+
+    if (STATE.inlineLatexObserver instanceof MutationObserver) {
+      return;
+    }
+
+    STATE.inlineLatexObserver = new MutationObserver((records) => {
+      for (const r of records) {
+        if (r.type === "characterData") {
+          const parent = r.target && r.target.parentElement;
+          if (parent instanceof Element) {
+            const inlineHost = parent.closest(".markdown p, .markdown li, .markdown td");
+            if (inlineHost) {
+              queueInlineLatexRender(inlineHost);
+            }
+          }
+          continue;
+        }
+
+        if (r.target instanceof Element) {
+          const host = r.target.closest(".markdown p, .markdown li, .markdown td");
+          if (host) {
+            queueInlineLatexRender(host);
+          }
+        }
+
+        for (const node of r.addedNodes) {
+          if (node instanceof Element) {
+            const host = node.closest(".markdown p, .markdown li, .markdown td");
+            if (host) {
+              queueInlineLatexRender(host);
+            }
+          }
+        }
+      }
+    });
+    STATE.inlineLatexObserver.observe(document.body, {
+      childList: true,
+      subtree: true,
+      characterData: true
+    });
+
+    if (STATE.inlineLatexSafetyTimer === 0) {
+      STATE.inlineLatexSafetyTimer = window.setInterval(() => {
+        if (document.visibilityState !== "visible") {
+          return;
+        }
+        ensureKatexRuntime();
+        queueInlineLatexForViewportTurns(2, CONFIG.inlineLatexLiveAssistantScanLimit);
+      }, 900);
+    }
+
+    startInlineLatexBootstrapTimer();
+  }
+
+  function startInlineLatexBootstrapTimer() {
+    if (STATE.inlineLatexBootstrapTimer !== 0) {
+      return;
+    }
+
+    STATE.inlineLatexBootstrapTimer = window.setInterval(() => {
+      if (STATE.inlineLatexBootstrapRuns >= CONFIG.inlineLatexBootstrapScanMaxRuns) {
+        clearInterval(STATE.inlineLatexBootstrapTimer);
+        STATE.inlineLatexBootstrapTimer = 0;
+        return;
+      }
+
+      if (document.visibilityState !== "visible") {
+        return;
+      }
+
+      STATE.inlineLatexBootstrapRuns += 1;
+      queueInlineLatexForViewportTurns(5, CONFIG.inlineLatexLiveAssistantScanLimit);
+    }, CONFIG.inlineLatexBootstrapScanMs);
+  }
+
+  function queueInlineLatexRender(root) {
+    const key = root instanceof Element ? root : document.body;
+    STATE.inlineLatexPendingRoots.set(key, performance.now());
+    scheduleInlineLatexFlush();
+  }
+
+  function scheduleInlineLatexFlush() {
+    const now = performance.now();
+    const waitForReady = Math.max(0, STATE.inlineLatexReadyAt - now);
+    const delay = Math.max(CONFIG.inlineLatexDebounceMs, Math.ceil(waitForReady));
+
+    if (STATE.inlineLatexFlushTimer !== 0) {
+      clearTimeout(STATE.inlineLatexFlushTimer);
+    }
+
+    STATE.inlineLatexFlushTimer = window.setTimeout(() => {
+      STATE.inlineLatexFlushTimer = 0;
+      flushInlineLatexQueue();
+    }, delay);
+  }
+
+  function flushInlineLatexQueue() {
+    if (STATE.inlineLatexPendingRoots.size === 0) {
+      return;
+    }
+
+    if (performance.now() < STATE.inlineLatexReadyAt) {
+      scheduleInlineLatexFlush();
+      return;
+    }
+
+    const roots = Array.from(STATE.inlineLatexPendingRoots.keys());
+    STATE.inlineLatexPendingRoots.clear();
+
+    let deferred = false;
+    for (const root of roots) {
+      const hosts = getInlineLatexHosts(root);
+      for (const host of hosts) {
+        if (!isInlineLatexHostStable(host)) {
+          STATE.inlineLatexPendingRoots.set(host, performance.now());
+          deferred = true;
+          continue;
+        }
+
+        renderInlineLatexInElement(host);
+      }
+    }
+
+    if (deferred) {
+      scheduleInlineLatexFlush();
+    }
+  }
+
+  function getInlineLatexHosts(root) {
+    if (!(root instanceof Element)) {
+      return [];
+    }
+
+    if (root.matches(".markdown p, .markdown li, .markdown td")) {
+      return [root];
+    }
+
+    return Array.from(root.querySelectorAll(".markdown p, .markdown li, .markdown td"));
+  }
+
+  function isInlineLatexHostStable(host) {
+    if (!(host instanceof Element) || !host.isConnected) {
+      return false;
+    }
+
+    if (host.closest("[data-writing-block]")) {
+      return false;
+    }
+
+    if (host.closest("pre, code")) {
+      return false;
+    }
+
+    return true;
+  }
+
+  function queueInlineLatexForViewportTurns(extraTurns = 0, limit = CONFIG.inlineLatexLiveAssistantScanLimit) {
+    if (STATE.totalTurns <= 0 || STATE.messages.length === 0) {
+      return;
+    }
+
+    const anchor = clamp(STATE.currentAnchorTurn, 0, STATE.totalTurns - 1);
+    const around = CONFIG.turnsAroundViewport + Math.max(0, extraTurns);
+    const minTurn = clamp(anchor - around, 0, STATE.totalTurns - 1);
+    const maxTurn = clamp(anchor + around, 0, STATE.totalTurns - 1);
+    queueInlineLatexForTurnRange(minTurn, maxTurn, limit);
+  }
+
+  function queueInlineLatexForTurnRange(minTurn, maxTurn, limit) {
+    let queued = 0;
+    for (let turn = minTurn; turn <= maxTurn; turn += 1) {
+      const ids = STATE.turnToIds.get(turn) || [];
+      for (const id of ids) {
+        const item = STATE.messageById.get(id);
+        if (!item || item.isPlaceholder || item.role !== CONFIG.assistantRole) {
+          continue;
+        }
+
+        if (item.el instanceof Element && item.el.isConnected) {
+          queueInlineLatexRender(item.el);
+          queued += 1;
+        }
+
+        if (queued >= limit) {
+          return;
+        }
+      }
+    }
+  }
+
+  function processInlineLatex(root) {
+    const containers = root.querySelectorAll
+      ? root.querySelectorAll(".markdown p, .markdown li, .markdown td")
+      : [];
+    for (const el of containers) {
+      renderInlineLatexInElement(el);
+    }
+    if (root instanceof Element && root.matches(".markdown p, .markdown li, .markdown td")) {
+      renderInlineLatexInElement(root);
+    }
+  }
+
+  function renderInlineLatexInElement(el) {
+    const textSnapshot = el.textContent || "";
+    if (!textSnapshot.includes("$")) {
+      STATE.inlineLatexSourceByHost.set(el, textSnapshot);
+      return;
+    }
+
+    if (STATE.inlineLatexSourceByHost.get(el) === textSnapshot) {
+      return;
+    }
+
+    const inStreamingBlock = !!el.closest("[data-writing-block]");
+    if (inStreamingBlock) {
+      const lastRenderAt = STATE.inlineLatexLastRenderAt.get(el) || 0;
+      if (performance.now() - lastRenderAt < CONFIG.inlineLatexStreamRenderMinIntervalMs) {
+        return;
+      }
+    }
+
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    const textNodes = [];
+    let node;
+    while ((node = walker.nextNode())) textNodes.push(node);
+
+    let changed = false;
+    for (const textNode of textNodes) {
+      if (textNode.parentElement?.closest(".katex, code, pre, [data-slimgpt-inline-math='1']")) continue;
+      const text = textNode.textContent || "";
+      if (!text.includes("$")) continue;
+
+      const parts = splitInlineMathSegments(text);
+      if (!parts.some(part => part.type === "math")) continue;
+
+      const frag = document.createDocumentFragment();
+      for (const part of parts) {
+        if (part.type === "math") {
+          frag.appendChild(buildInlineMathNode(part.value));
+        } else {
+          frag.appendChild(document.createTextNode(part.value));
+        }
+      }
+      textNode.replaceWith(frag);
+      changed = true;
+    }
+
+    if (changed) {
+      STATE.inlineLatexSourceByHost.set(el, el.textContent || "");
+      STATE.inlineLatexLastRenderAt.set(el, performance.now());
+    } else {
+      STATE.inlineLatexSourceByHost.set(el, textSnapshot);
+    }
+  }
+
+  function splitInlineMathSegments(text) {
+    const result = [];
+    let buffer = "";
+    let mathBuffer = "";
+    let inMath = false;
+
+    for (let i = 0; i < text.length; i += 1) {
+      const ch = text[i];
+      const next = i + 1 < text.length ? text[i + 1] : "";
+
+      if (ch === "\\" && next === "$") {
+        if (inMath) {
+          mathBuffer += "$";
+        } else {
+          buffer += "$";
+        }
+        i += 1;
+        continue;
+      }
+
+      if (ch === "$") {
+        if (inMath) {
+          const latex = mathBuffer.trim();
+          if (latex) {
+            result.push({ type: "math", value: latex });
+          } else {
+            buffer += "$$";
+          }
+          mathBuffer = "";
+          inMath = false;
+        } else {
+          if (buffer) {
+            result.push({ type: "text", value: buffer });
+            buffer = "";
+          }
+          inMath = true;
+        }
+        continue;
+      }
+
+      if (inMath && (ch === "\n" || ch === "\r")) {
+        buffer += `$${mathBuffer}${ch}`;
+        mathBuffer = "";
+        inMath = false;
+        continue;
+      }
+
+      if (inMath) {
+        mathBuffer += ch;
+      } else {
+        buffer += ch;
+      }
+    }
+
+    if (inMath) {
+      buffer += `$${mathBuffer}`;
+    }
+    if (buffer) {
+      result.push({ type: "text", value: buffer });
+    }
+
+    return result;
+  }
+
+  function buildInlineMathNode(latex) {
+    const wrap = document.createElement("span");
+    wrap.className = "slimgpt-inline-math-wrap";
+    wrap.setAttribute("data-slimgpt-inline-math", "1");
+
+    const rendered = document.createElement("span");
+    rendered.className = "slimgpt-inline-math";
+    renderInlineMathToNode(rendered, latex);
+
+    wrap.appendChild(rendered);
+    bindLatexCopyTarget(wrap, latex);
+    return wrap;
+  }
+
+  function renderInlineMathToNode(target, latex) {
+    const source = String(latex || "").trim();
+    const normalized = normalizeInlineLatexForRetry(source);
+    const candidates = normalized && normalized !== source ? [source, normalized] : [source];
+
+    if (window.katex && typeof window.katex.render === "function") {
+      for (const expr of candidates) {
+        try {
+          window.katex.render(expr, target, {
+            throwOnError: true,
+            displayMode: false,
+            strict: "ignore"
+          });
+          target.classList.remove("is-fallback");
+          return;
+        } catch {
+          // Try next candidate.
+        }
+      }
+    }
+
+    target.classList.add("is-fallback");
+    target.textContent = formatInlineLatexFallback(normalized || source);
+  }
+
+  function normalizeInlineLatexForRetry(latex) {
+    let text = String(latex || "").trim();
+    if (!text) {
+      return text;
+    }
+
+    text = text
+      .replace(/\\([，。；：、])/g, "$1")
+      .replace(/[，]/g, ",")
+      .replace(/[；]/g, ";")
+      .replace(/[：]/g, ":")
+      .replace(/[（]/g, "(")
+      .replace(/[）]/g, ")")
+      .replace(/[【]/g, "[")
+      .replace(/[】]/g, "]");
+
+    // Recover missing leading backslash for common environments.
+    text = text
+      .replace(/(^|[^\\])begin\{(cases|matrix|pmatrix|bmatrix|Bmatrix|vmatrix|Vmatrix|array)\}/g, "$1\\\\begin{$2}")
+      .replace(/(^|[^\\])end\{(cases|matrix|pmatrix|bmatrix|Bmatrix|vmatrix|Vmatrix|array)\}/g, "$1\\\\end{$2}");
+
+    // Common LLM slip: row break in cases/matrix is emitted as "\-x" or "\3".
+    text = text.replace(/([0-9A-Za-z\}\)])\\(?=\s*[-+0-9])/g, "$1\\\\");
+
+    return text;
+  }
+
+  function formatInlineLatexFallback(latex) {
+    let text = String(latex || "").trim();
+    if (!text) {
+      return text;
+    }
+
+    text = replaceFractionLike(text);
+    text = text
+      .replace(/\\?sqrt\s*\{([^{}]+)\}/g, "√($1)")
+      .replace(/\\?operatorname\s*\{([^{}]+)\}/g, "$1")
+      .replace(/\\?mathrm\s*\{([^{}]+)\}/g, "$1")
+      .replace(/\\?mathbb\s*\{([RNCQZ])\}/g, (_, setName) => {
+        const map = { R: "ℝ", N: "ℕ", C: "ℂ", Q: "ℚ", Z: "ℤ" };
+        return map[setName] || setName;
+      });
+
+    const macros = [
+      ["\\to", "→"],
+      ["\\rightarrow", "→"],
+      ["\\leftarrow", "←"],
+      ["\\approx", "≈"],
+      ["\\neq", "≠"],
+      ["\\leq", "≤"],
+      ["\\geq", "≥"],
+      ["\\infty", "∞"],
+      ["\\partial", "∂"],
+      ["\\sum", "∑"],
+      ["\\int", "∫"],
+      ["\\lambda", "λ"],
+      ["\\theta", "θ"],
+      ["\\pi", "π"],
+      ["\\sin", "sin"],
+      ["\\cos", "cos"],
+      ["\\tan", "tan"],
+      ["\\ln", "ln"],
+      ["\\det", "det"],
+      ["\\cdot", "·"],
+      ["\\times", "×"]
+    ];
+
+    for (const [token, value] of macros) {
+      text = text.split(token).join(value);
+    }
+
+    const bareGreek = [
+      ["alpha", "α"],
+      ["beta", "β"],
+      ["gamma", "γ"],
+      ["delta", "δ"],
+      ["epsilon", "ε"],
+      ["lambda", "λ"],
+      ["mu", "μ"],
+      ["pi", "π"],
+      ["sigma", "σ"],
+      ["theta", "θ"],
+      ["rho", "ρ"],
+      ["omega", "ω"]
+    ];
+
+    for (const [word, symbol] of bareGreek) {
+      text = text.replace(new RegExp(`\\\\?${word}\\b`, "g"), symbol);
+      text = text.replace(new RegExp(`\\\\?${capitalize(word)}\\b`, "g"), symbol);
+    }
+
+    text = text
+      .replace(/([A-Za-z0-9)\]])in(ℝ|ℕ|ℂ|ℚ|ℤ)/g, "$1∈$2")
+      .replace(/([A-Za-z0-9)\]])\\in(ℝ|ℕ|ℂ|ℚ|ℤ)/g, "$1∈$2");
+
+    text = text.replace(/\^([A-Za-z0-9+\-()])/g, (_, value) => toSuperscript(value));
+    text = text.replace(/_([A-Za-z0-9+\-()])/g, (_, value) => toSubscript(value));
+
+    text = text
+      .replace(/\^\{([^{}]+)\}/g, (_, value) => toSuperscript(value))
+      .replace(/_\{([^{}]+)\}/g, (_, value) => toSubscript(value))
+      .replace(/\\,/g, " ")
+      .replace(/\\left/g, "")
+      .replace(/\\right/g, "")
+      .replace(/\\\(/g, "(")
+      .replace(/\\\)/g, ")")
+      .replace(/\\\[/g, "[")
+      .replace(/\\\]/g, "]")
+      .replace(/\\([a-zA-Z]+)/g, "$1")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    return text;
+  }
+
+  function replaceFractionLike(input) {
+    let text = String(input || "");
+    let previous = "";
+
+    // Handle both \frac{a}{b} and frac{a}{b}; repeat to reduce nested cases.
+    while (text !== previous) {
+      previous = text;
+      text = text.replace(/\\?frac\s*\{([^{}]+)\}\s*\{([^{}]+)\}/g, "($1)/($2)");
+    }
+
+    return text;
+  }
+
+  function toSuperscript(value) {
+    const map = {
+      "0": "⁰", "1": "¹", "2": "²", "3": "³", "4": "⁴",
+      "5": "⁵", "6": "⁶", "7": "⁷", "8": "⁸", "9": "⁹",
+      "+": "⁺", "-": "⁻", "=": "⁼", "(": "⁽", ")": "⁾",
+      "n": "ⁿ", "i": "ⁱ"
+    };
+    let out = "";
+    for (const ch of String(value || "")) {
+      if (!map[ch]) {
+        return `^(${value})`;
+      }
+      out += map[ch];
+    }
+    return out || `^(${value})`;
+  }
+
+  function toSubscript(value) {
+    const map = {
+      "0": "₀", "1": "₁", "2": "₂", "3": "₃", "4": "₄",
+      "5": "₅", "6": "₆", "7": "₇", "8": "₈", "9": "₉",
+      "+": "₊", "-": "₋", "=": "₌", "(": "₍", ")": "₎",
+      "a": "ₐ", "e": "ₑ", "h": "ₕ", "i": "ᵢ", "j": "ⱼ",
+      "k": "ₖ", "l": "ₗ", "m": "ₘ", "n": "ₙ", "o": "ₒ",
+      "p": "ₚ", "r": "ᵣ", "s": "ₛ", "t": "ₜ", "u": "ᵤ",
+      "v": "ᵥ", "x": "ₓ"
+    };
+    let out = "";
+    for (const ch of String(value || "")) {
+      const key = ch.toLowerCase();
+      if (!map[key]) {
+        return `_(${value})`;
+      }
+      out += map[key];
+    }
+    return out || `_(${value})`;
+  }
+
+  function capitalize(text) {
+    const s = String(text || "");
+    if (!s) return s;
+    return s[0].toUpperCase() + s.slice(1);
   }
 
   if (document.readyState === "loading") {

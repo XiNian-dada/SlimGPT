@@ -10,12 +10,25 @@
         "https://chat.openai.com/*"
       ],
       "js": [
+        "vendor/katex/katex.min.js",
         "content.js"
       ],
       "css": [
         "styles.css"
       ],
       "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "vendor/katex/katex.min.css",
+        "vendor/katex/fonts/*"
+      ],
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*"
+      ]
     }
   ]
 }
