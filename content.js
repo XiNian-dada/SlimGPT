@@ -37,6 +37,9 @@
     bootstrapModelRetryMs: 260,
     bootstrapModelMaxRetries: 70,
     composerInitDelayMs: 1200,
+    searchDebounceMs: 220,
+    searchMinChars: 2,
+    statsUpdateThrottleMs: 400,
     maxSnippetLength: 120,
     minPlaceholderHeight: 24
   };
@@ -72,6 +75,7 @@
     minimapDeferredTimer: 0,
     typingSyncDueAt: 0,
     composerInitStarted: false,
+    conversationActive: false,
     composerSubmitListenerBound: false,
     inlineLatexObserver: null,
     inlineLatexPendingRoots: new Map(),
@@ -83,6 +87,15 @@
     inlineLatexSourceByHost: new WeakMap(),
     inlineLatexLastRenderAt: new WeakMap(),
     latexCopyDelegateBound: false,
+    panelBound: false,
+    statsEnabled: false,
+    statsLastUpdateAt: 0,
+    lastSyncDurationMs: 0,
+    lastSyncAt: 0,
+    searchQuery: "",
+    searchMatches: [],
+    searchIndex: -1,
+    searchTimer: 0,
 
     collapsedById: new Map(),
     heightById: new Map(),
@@ -93,22 +106,23 @@
 
   function init() {
     cleanupLegacyUi();
-    ensureKatexStyles();
-    ensureMiniMap();
     bindGlobalListeners();
     observeDomChanges();
     observeUrlChanges();
-    initLatexCopyButtons();
-    initInlineLatexRenderer();
-    initComposerExpand();
+    if (isConversationPage()) {
+      activateConversationFeatures();
+    } else {
+      deactivateConversationFeatures();
+    }
     scheduleSync();
-    scheduleBootstrapSync();
   }
 
   function cleanupLegacyUi() {
     document.querySelector("[data-slimgpt-controls]")?.remove();
     document.querySelector("[data-slimgpt-minimap]")?.remove();
     document.querySelector("[data-slimgpt-preview]")?.remove();
+    document.querySelector("[data-slimgpt-panel]")?.remove();
+    document.querySelector("[data-slimgpt-stats]")?.remove();
     document.getElementById("slimgpt-katex-js")?.remove();
     document.getElementById("slimgpt-katex-css")?.remove();
     document.querySelectorAll("script[src*='cdn.jsdelivr.net/npm/katex'], link[href*='cdn.jsdelivr.net/npm/katex']")
@@ -143,6 +157,13 @@
     STATE.inlineLatexLastRenderAt = new WeakMap();
     STATE.inlineLatexBootstrapRuns = 0;
     STATE.bootstrapSyncAttempts = 0;
+    STATE.searchQuery = "";
+    STATE.searchMatches = [];
+    STATE.searchIndex = -1;
+    if (STATE.searchTimer !== 0) {
+      clearTimeout(STATE.searchTimer);
+      STATE.searchTimer = 0;
+    }
     STATE.lastMiniMapSignature = "";
     STATE.lastMiniMapAnchorTurn = -1;
     STATE.lastMiniMapRenderAt = 0;
@@ -476,7 +497,11 @@
 
       restoreAllCollapsedMessages();
       scheduleSync();
-      scheduleBootstrapSync();
+      if (isConversationPage()) {
+        activateConversationFeatures();
+      } else {
+        deactivateConversationFeatures();
+      }
     }, 900);
   }
 
@@ -493,77 +518,94 @@
   }
 
   function sync() {
-    ensureMiniMap();
+    const syncStart = performance.now();
 
-    const typingHot = isTypingHot();
-    const scrollingHot = Date.now() - STATE.lastScrollAt < CONFIG.fastScrollWindowMs;
+    try {
+      if (!isConversationPage()) {
+        if (STATE.conversationActive) {
+          deactivateConversationFeatures();
+        }
+        return;
+      }
 
-    if (STATE.modelDirty) {
+      if (!STATE.conversationActive) {
+        activateConversationFeatures();
+      }
+
+      ensureMiniMap();
+
+      const typingHot = isTypingHot();
+      const scrollingHot = Date.now() - STATE.lastScrollAt < CONFIG.fastScrollWindowMs;
+
+      if (STATE.modelDirty) {
+        if (typingHot && !scrollingHot) {
+          scheduleSyncAfterTyping(false);
+          return;
+        }
+
+        rebuildModel();
+      }
+
+      if (STATE.totalTurns <= 0 || STATE.messages.length === 0) {
+        scheduleBootstrapSync();
+        updateMiniMap();
+        return;
+      }
+      cancelBootstrapSync();
+
+      if (STATE.mode === "expanded") {
+        restoreAllCollapsedMessages();
+        if (STATE.modelDirty) {
+          rebuildModel();
+        }
+
+        STATE.collapseTargetRange = null;
+        updateMiniMap();
+        queueInlineLatexForViewportTurns(2);
+        return;
+      }
+
       if (typingHot && !scrollingHot) {
+        // Typing has highest priority for rendering, but still keep collapsing far turns in background.
+        const anchorTurn = findAnchorTurn();
+        STATE.previousAnchorTurn = STATE.currentAnchorTurn;
+        STATE.currentAnchorTurn = anchorTurn;
+        const minTurn = clamp(anchorTurn - 1, 0, STATE.totalTurns - 1);
+        const maxTurn = clamp(anchorTurn + 1, 0, STATE.totalTurns - 1);
+        enforceLiveTurnBudget(anchorTurn, true);
+        requestBackgroundCollapse(minTurn, maxTurn);
+        updateMiniMap();
+        queueInlineLatexForViewportTurns(2);
         scheduleSyncAfterTyping(false);
         return;
       }
 
-      rebuildModel();
-    }
-
-    if (STATE.totalTurns <= 0 || STATE.messages.length === 0) {
-      scheduleBootstrapSync();
-      updateMiniMap();
-      return;
-    }
-    cancelBootstrapSync();
-
-    if (STATE.mode === "expanded") {
-      restoreAllCollapsedMessages();
-      if (STATE.modelDirty) {
-        rebuildModel();
-      }
-
-      STATE.collapseTargetRange = null;
-      updateMiniMap();
-      queueInlineLatexForViewportTurns(2);
-      return;
-    }
-
-    if (typingHot && !scrollingHot) {
-      // Typing has highest priority for rendering, but still keep collapsing far turns in background.
       const anchorTurn = findAnchorTurn();
+      const anchorDelta = Math.abs(anchorTurn - STATE.currentAnchorTurn);
       STATE.previousAnchorTurn = STATE.currentAnchorTurn;
       STATE.currentAnchorTurn = anchorTurn;
-      const minTurn = clamp(anchorTurn - 1, 0, STATE.totalTurns - 1);
-      const maxTurn = clamp(anchorTurn + 1, 0, STATE.totalTurns - 1);
-      enforceLiveTurnBudget(anchorTurn, true);
+
+      const dynamicTurnsAround = getDynamicTurnsAroundViewport(anchorDelta);
+      const effectiveTurnsAround = STATE.inputFocused
+        ? Math.min(dynamicTurnsAround, 2)
+        : dynamicTurnsAround;
+      const minTurn = clamp(anchorTurn - effectiveTurnsAround, 0, STATE.totalTurns - 1);
+      const maxTurn = clamp(anchorTurn + effectiveTurnsAround, 0, STATE.totalTurns - 1);
+
+      // Critical path: restore around viewport immediately.
+      restoreTurnsImmediately(minTurn, maxTurn);
+
+      // Hard cap: never keep too many full turns in DOM.
+      enforceLiveTurnBudget(anchorTurn, false);
+
+      // Background path: collapse far turns lazily.
       requestBackgroundCollapse(minTurn, maxTurn);
+
       updateMiniMap();
-      queueInlineLatexForViewportTurns(2);
-      scheduleSyncAfterTyping(false);
-      return;
+      queueInlineLatexForViewportTurns();
+    } finally {
+      finalizeSync(syncStart);
     }
-
-    const anchorTurn = findAnchorTurn();
-    const anchorDelta = Math.abs(anchorTurn - STATE.currentAnchorTurn);
-    STATE.previousAnchorTurn = STATE.currentAnchorTurn;
-    STATE.currentAnchorTurn = anchorTurn;
-
-    const dynamicTurnsAround = getDynamicTurnsAroundViewport(anchorDelta);
-    const effectiveTurnsAround = STATE.inputFocused
-      ? Math.min(dynamicTurnsAround, 2)
-      : dynamicTurnsAround;
-    const minTurn = clamp(anchorTurn - effectiveTurnsAround, 0, STATE.totalTurns - 1);
-    const maxTurn = clamp(anchorTurn + effectiveTurnsAround, 0, STATE.totalTurns - 1);
-
-    // Critical path: restore around viewport immediately.
-    restoreTurnsImmediately(minTurn, maxTurn);
-
-    // Hard cap: never keep too many full turns in DOM.
-    enforceLiveTurnBudget(anchorTurn, false);
-
-    // Background path: collapse far turns lazily.
-    requestBackgroundCollapse(minTurn, maxTurn);
-
-    updateMiniMap();
-    queueInlineLatexForViewportTurns();
   }
 
   function rebuildModel() {
@@ -667,6 +709,10 @@
     cleanupCollapsedRecords();
     if (STATE.inlineLatexBootstrapRuns < CONFIG.inlineLatexBootstrapScanMaxRuns) {
       queueInlineLatexForViewportTurns(4, CONFIG.inlineLatexLiveAssistantScanLimit);
+    }
+
+    if (STATE.searchQuery) {
+      refreshSearchMatches();
     }
   }
 
@@ -974,6 +1020,36 @@
     queueInlineLatexRender(record.node);
   }
 
+  function activateConversationFeatures() {
+    if (STATE.conversationActive) {
+      return;
+    }
+    if (!isConversationPage()) {
+      return;
+    }
+
+    STATE.conversationActive = true;
+    ensureKatexStyles();
+    ensureMiniMap();
+    initLatexCopyButtons();
+    initInlineLatexRenderer();
+    initComposerExpand();
+    scheduleBootstrapSync();
+    if (STATE.statsEnabled) {
+      ensureStatsBadge();
+    }
+  }
+
+  function deactivateConversationFeatures() {
+    if (!STATE.conversationActive) {
+      cleanupLegacyUi();
+      return;
+    }
+
+    STATE.conversationActive = false;
+    cleanupLegacyUi();
+  }
+
   function isConversationPage() {
     return /^\/c\//.test(location.pathname);
   }
@@ -1172,6 +1248,10 @@
   }
 
   function ensureMiniMap() {
+    if (!isConversationPage()) {
+      return;
+    }
+
     if (document.querySelector("[data-slimgpt-minimap]")) {
       return;
     }
@@ -1198,6 +1278,21 @@
       exportChatAsJson();
     });
     actions.appendChild(exportBtn);
+
+    const menuBtn = document.createElement("button");
+    menuBtn.type = "button";
+    menuBtn.className = "slimgpt-minimap-action";
+    menuBtn.setAttribute("data-slimgpt-menu", "1");
+    menuBtn.setAttribute("aria-label", "Open SlimGPT menu");
+    menuBtn.textContent = "⋯";
+    menuBtn.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      toggleMinimapPanel();
+    });
+    actions.appendChild(menuBtn);
+
+    ensureMinimapPanel();
 
     const preview = document.createElement("div");
     preview.className = "slimgpt-dot-preview";
@@ -1293,6 +1388,10 @@
   }
 
   function updateMiniMap(force = false) {
+    if (!isConversationPage()) {
+      return;
+    }
+
     const root = document.querySelector("[data-slimgpt-minimap]");
     if (!(root instanceof HTMLElement)) return;
 
@@ -1437,6 +1536,200 @@
 
     const filename = buildExportFilename(payload);
     downloadJson(payload, filename);
+  }
+
+  function scheduleSearch(query) {
+    const value = String(query || "").trim();
+    STATE.searchQuery = value;
+
+    if (STATE.searchTimer !== 0) {
+      clearTimeout(STATE.searchTimer);
+    }
+
+    STATE.searchTimer = window.setTimeout(() => {
+      STATE.searchTimer = 0;
+      refreshSearchMatches();
+    }, CONFIG.searchDebounceMs);
+  }
+
+  function refreshSearchMatches() {
+    const needle = STATE.searchQuery;
+    const meta = getSearchMetaEl();
+
+    if (!needle || needle.length < CONFIG.searchMinChars) {
+      STATE.searchMatches = [];
+      STATE.searchIndex = -1;
+      if (meta) {
+        meta.textContent = "0/0";
+      }
+      return;
+    }
+
+    const matches = buildSearchMatches(needle);
+    STATE.searchMatches = matches;
+
+    if (matches.length === 0) {
+      STATE.searchIndex = -1;
+      if (meta) {
+        meta.textContent = "0/0";
+      }
+      return;
+    }
+
+    const anchor = STATE.currentAnchorTurn || 0;
+    const nextIdx = matches.findIndex((turn) => turn >= anchor);
+    STATE.searchIndex = nextIdx >= 0 ? nextIdx : 0;
+
+    updateSearchMeta();
+  }
+
+  function buildSearchMatches(query) {
+    const needle = String(query || "").toLowerCase();
+    const matches = [];
+
+    for (let turn = 0; turn < STATE.totalTurns; turn += 1) {
+      const ids = STATE.turnToIds.get(turn) || [];
+      let combined = "";
+      for (const id of ids) {
+        const item = STATE.messageById.get(id);
+        if (!item) continue;
+        const text = getSearchTextForItem(item);
+        if (text) {
+          combined += ` ${text}`;
+        }
+      }
+      if (combined && combined.toLowerCase().includes(needle)) {
+        matches.push(turn);
+      }
+    }
+
+    return matches;
+  }
+
+  function getSearchTextForItem(item) {
+    const root = getExportRootForItem(item);
+    if (root instanceof HTMLElement) {
+      const text = normalizeSearchText(extractTextFromRoot(root));
+      if (text) {
+        return text;
+      }
+    }
+
+    if (item?.snippet) {
+      return normalizeSearchText(item.snippet);
+    }
+
+    return "";
+  }
+
+  function normalizeSearchText(text) {
+    return String(text || "").replace(/\s+/g, " ").trim();
+  }
+
+  function searchNext() {
+    if (!STATE.searchMatches.length) {
+      refreshSearchMatches();
+    }
+    if (!STATE.searchMatches.length) {
+      return;
+    }
+
+    STATE.searchIndex = (STATE.searchIndex + 1) % STATE.searchMatches.length;
+    jumpToTurn(STATE.searchMatches[STATE.searchIndex]);
+    updateSearchMeta();
+  }
+
+  function searchPrev() {
+    if (!STATE.searchMatches.length) {
+      refreshSearchMatches();
+    }
+    if (!STATE.searchMatches.length) {
+      return;
+    }
+
+    STATE.searchIndex = (STATE.searchIndex - 1 + STATE.searchMatches.length) % STATE.searchMatches.length;
+    jumpToTurn(STATE.searchMatches[STATE.searchIndex]);
+    updateSearchMeta();
+  }
+
+  function updateSearchMeta() {
+    const meta = getSearchMetaEl();
+    if (!meta) {
+      return;
+    }
+
+    if (!STATE.searchMatches.length || STATE.searchIndex < 0) {
+      meta.textContent = "0/0";
+      return;
+    }
+
+    meta.textContent = `${STATE.searchIndex + 1}/${STATE.searchMatches.length}`;
+  }
+
+  function getSearchMetaEl() {
+    const panel = document.querySelector("[data-slimgpt-panel='1']");
+    if (!(panel instanceof HTMLElement)) {
+      return null;
+    }
+    const meta = panel.querySelector("[data-slimgpt-search-meta='1']");
+    return meta instanceof HTMLElement ? meta : null;
+  }
+
+  function exportChatAsMarkdown() {
+    if (!isConversationPage()) {
+      return;
+    }
+
+    if (STATE.modelDirty && !isTypingHot()) {
+      rebuildModel();
+    }
+
+    const payload = buildExportPayload();
+    if (!payload) {
+      return;
+    }
+
+    const markdown = buildMarkdownFromPayload(payload);
+    const filename = buildExportFilenameWithExt(payload, "md");
+    downloadText(markdown, "text/markdown;charset=utf-8", filename);
+  }
+
+  function exportChatAsText() {
+    if (!isConversationPage()) {
+      return;
+    }
+
+    if (STATE.modelDirty && !isTypingHot()) {
+      rebuildModel();
+    }
+
+    const payload = buildExportPayload();
+    if (!payload) {
+      return;
+    }
+
+    const text = buildPlainTextFromPayload(payload);
+    const filename = buildExportFilenameWithExt(payload, "txt");
+    downloadText(text, "text/plain;charset=utf-8", filename);
+  }
+
+  function exportChatAsCsv() {
+    if (!isConversationPage()) {
+      return;
+    }
+
+    if (STATE.modelDirty && !isTypingHot()) {
+      rebuildModel();
+    }
+
+    const payload = buildExportPayload();
+    if (!payload) {
+      return;
+    }
+
+    const csv = buildCsvFromPayload(payload);
+    const filename = buildExportFilenameWithExt(payload, "csv");
+    downloadText(csv, "text/csv;charset=utf-8", filename);
   }
 
   function buildExportPayload() {
@@ -1631,6 +1924,13 @@
     return `slimgpt-${stamp}-${title}.json`;
   }
 
+  function buildExportFilenameWithExt(payload, ext) {
+    const stamp = formatDateForFilename(new Date());
+    const title = sanitizeFilename(payload?.title || "chatgpt");
+    const safeExt = String(ext || "json").replace(/[^a-z0-9]/gi, "");
+    return `slimgpt-${stamp}-${title}.${safeExt || "json"}`;
+  }
+
   function formatDateForFilename(date) {
     const pad = (num) => String(num).padStart(2, "0");
     return [
@@ -1666,6 +1966,399 @@
     window.setTimeout(() => {
       URL.revokeObjectURL(url);
     }, 1000);
+  }
+
+  function downloadText(text, mimeType, filename) {
+    const blob = new Blob([text], { type: mimeType });
+    const url = URL.createObjectURL(blob);
+
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    link.style.position = "fixed";
+    link.style.left = "-9999px";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+
+    window.setTimeout(() => {
+      URL.revokeObjectURL(url);
+    }, 1000);
+  }
+
+  function toggleStats() {
+    STATE.statsEnabled = !STATE.statsEnabled;
+    updateStatsToggleLabel();
+
+    if (STATE.statsEnabled) {
+      ensureStatsBadge();
+      updatePerfStats(true);
+    } else {
+      removeStatsBadge();
+    }
+  }
+
+  function updateStatsToggleLabel() {
+    const panel = document.querySelector("[data-slimgpt-panel='1']");
+    if (!(panel instanceof HTMLElement)) {
+      return;
+    }
+    const toggle = panel.querySelector("[data-slimgpt-stats-toggle='1']");
+    if (toggle instanceof HTMLElement) {
+      toggle.textContent = STATE.statsEnabled ? "Perf: On" : "Perf: Off";
+    }
+  }
+
+  function ensureStatsBadge() {
+    if (document.querySelector("[data-slimgpt-stats='1']")) {
+      return;
+    }
+
+    const badge = document.createElement("div");
+    badge.className = "slimgpt-stats";
+    badge.setAttribute("data-slimgpt-stats", "1");
+    badge.textContent = "Stats: --";
+    document.body.appendChild(badge);
+  }
+
+  function removeStatsBadge() {
+    document.querySelector("[data-slimgpt-stats='1']")?.remove();
+  }
+
+  function updatePerfStats(force = false) {
+    if (!STATE.statsEnabled) {
+      return;
+    }
+
+    const now = performance.now();
+    if (!force && now - STATE.statsLastUpdateAt < CONFIG.statsUpdateThrottleMs) {
+      return;
+    }
+    STATE.statsLastUpdateAt = now;
+
+    const badge = document.querySelector("[data-slimgpt-stats='1']");
+    if (!(badge instanceof HTMLElement)) {
+      return;
+    }
+
+    const totalMessages = STATE.messages.length;
+    let placeholders = 0;
+    for (const item of STATE.messages) {
+      if (item.isPlaceholder) {
+        placeholders += 1;
+      }
+    }
+
+    const full = Math.max(totalMessages - placeholders, 0);
+    const syncMs = Math.round(STATE.lastSyncDurationMs || 0);
+    badge.textContent = `Turns ${STATE.totalTurns} · Full ${full} · Collapsed ${placeholders} · Sync ${syncMs}ms`;
+  }
+
+  function finalizeSync(startTime) {
+    STATE.lastSyncDurationMs = performance.now() - startTime;
+    STATE.lastSyncAt = Date.now();
+    updatePerfStats();
+  }
+
+  function ensureMinimapPanel() {
+    if (document.querySelector("[data-slimgpt-panel]")) {
+      return;
+    }
+
+    const panel = document.createElement("div");
+    panel.className = "slimgpt-minimap-panel";
+    panel.setAttribute("data-slimgpt-panel", "1");
+    panel.setAttribute("aria-hidden", "true");
+
+    panel.appendChild(buildPanelSearchSection());
+    panel.appendChild(buildPanelExportSection());
+    panel.appendChild(buildPanelStatsSection());
+
+    panel.addEventListener("click", (event) => {
+      event.stopPropagation();
+    });
+
+    document.body.appendChild(panel);
+    updateStatsToggleLabel();
+
+    if (!STATE.panelBound) {
+      STATE.panelBound = true;
+      document.addEventListener("click", (event) => {
+        if (!(event.target instanceof Element)) {
+          return;
+        }
+
+        if (event.target.closest("[data-slimgpt-panel='1']")) {
+          return;
+        }
+
+        if (event.target.closest("[data-slimgpt-menu='1']")) {
+          return;
+        }
+
+        closeMinimapPanel();
+      }, { capture: true });
+
+      document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") {
+          closeMinimapPanel();
+        }
+      }, { capture: true });
+
+      window.addEventListener("resize", () => {
+        if (isMinimapPanelOpen()) {
+          positionMinimapPanel();
+        }
+      }, { passive: true });
+    }
+  }
+
+  function buildPanelSearchSection() {
+    const section = document.createElement("div");
+    section.className = "slimgpt-panel-section";
+
+    const title = document.createElement("div");
+    title.className = "slimgpt-panel-title";
+    title.textContent = "Search";
+
+    const row = document.createElement("div");
+    row.className = "slimgpt-panel-search";
+
+    const input = document.createElement("input");
+    input.type = "search";
+    input.placeholder = "Find in chat…";
+    input.className = "slimgpt-panel-input";
+    input.setAttribute("data-slimgpt-search-input", "1");
+    input.addEventListener("input", () => {
+      scheduleSearch(input.value);
+    });
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        if (event.shiftKey) {
+          searchPrev();
+        } else {
+          searchNext();
+        }
+      }
+    });
+
+    const prevBtn = document.createElement("button");
+    prevBtn.type = "button";
+    prevBtn.className = "slimgpt-panel-btn";
+    prevBtn.textContent = "↑";
+    prevBtn.setAttribute("aria-label", "Previous match");
+    prevBtn.addEventListener("click", () => searchPrev());
+
+    const nextBtn = document.createElement("button");
+    nextBtn.type = "button";
+    nextBtn.className = "slimgpt-panel-btn";
+    nextBtn.textContent = "↓";
+    nextBtn.setAttribute("aria-label", "Next match");
+    nextBtn.addEventListener("click", () => searchNext());
+
+    row.appendChild(input);
+    row.appendChild(prevBtn);
+    row.appendChild(nextBtn);
+
+    const meta = document.createElement("div");
+    meta.className = "slimgpt-panel-meta";
+    meta.setAttribute("data-slimgpt-search-meta", "1");
+    meta.textContent = "0/0";
+
+    section.appendChild(title);
+    section.appendChild(row);
+    section.appendChild(meta);
+    return section;
+  }
+
+  function buildPanelExportSection() {
+    const section = document.createElement("div");
+    section.className = "slimgpt-panel-section";
+
+    const title = document.createElement("div");
+    title.className = "slimgpt-panel-title";
+    title.textContent = "Export";
+
+    const row = document.createElement("div");
+    row.className = "slimgpt-panel-buttons";
+
+    const jsonBtn = createPanelButton("JSON", "Export JSON", exportChatAsJson);
+    const mdBtn = createPanelButton("MD", "Export Markdown", exportChatAsMarkdown);
+    const txtBtn = createPanelButton("TXT", "Export Text", exportChatAsText);
+    const csvBtn = createPanelButton("CSV", "Export CSV", exportChatAsCsv);
+
+    row.appendChild(jsonBtn);
+    row.appendChild(mdBtn);
+    row.appendChild(txtBtn);
+    row.appendChild(csvBtn);
+
+    section.appendChild(title);
+    section.appendChild(row);
+    return section;
+  }
+
+  function buildPanelStatsSection() {
+    const section = document.createElement("div");
+    section.className = "slimgpt-panel-section";
+
+    const title = document.createElement("div");
+    title.className = "slimgpt-panel-title";
+    title.textContent = "Performance";
+
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "slimgpt-panel-toggle";
+    toggle.setAttribute("data-slimgpt-stats-toggle", "1");
+    toggle.textContent = "Perf: Off";
+    toggle.addEventListener("click", () => toggleStats());
+
+    section.appendChild(title);
+    section.appendChild(toggle);
+    return section;
+  }
+
+  function createPanelButton(label, ariaLabel, handler) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "slimgpt-panel-btn";
+    btn.textContent = label;
+    btn.setAttribute("aria-label", ariaLabel);
+    btn.addEventListener("click", () => handler());
+    return btn;
+  }
+
+  function toggleMinimapPanel() {
+    if (isMinimapPanelOpen()) {
+      closeMinimapPanel();
+      return;
+    }
+    openMinimapPanel();
+  }
+
+  function openMinimapPanel() {
+    const panel = document.querySelector("[data-slimgpt-panel='1']");
+    if (!(panel instanceof HTMLElement)) {
+      return;
+    }
+    panel.classList.add("is-open");
+    panel.setAttribute("aria-hidden", "false");
+    positionMinimapPanel();
+
+    const input = panel.querySelector("[data-slimgpt-search-input='1']");
+    if (input instanceof HTMLInputElement) {
+      input.focus();
+      input.select();
+    }
+  }
+
+  function closeMinimapPanel() {
+    const panel = document.querySelector("[data-slimgpt-panel='1']");
+    if (!(panel instanceof HTMLElement)) {
+      return;
+    }
+    panel.classList.remove("is-open");
+    panel.setAttribute("aria-hidden", "true");
+  }
+
+  function isMinimapPanelOpen() {
+    const panel = document.querySelector("[data-slimgpt-panel='1']");
+    return !!(panel instanceof HTMLElement && panel.classList.contains("is-open"));
+  }
+
+  function positionMinimapPanel() {
+    const panel = document.querySelector("[data-slimgpt-panel='1']");
+    const anchor = document.querySelector("[data-slimgpt-minimap]");
+    if (!(panel instanceof HTMLElement) || !(anchor instanceof HTMLElement)) {
+      return;
+    }
+
+    const rect = anchor.getBoundingClientRect();
+    const left = rect.right + 10;
+    const top = Math.min(
+      Math.max(12, rect.bottom - panel.offsetHeight - 8),
+      window.innerHeight - panel.offsetHeight - 12
+    );
+
+    panel.style.left = `${Math.max(12, left)}px`;
+    panel.style.top = `${top}px`;
+  }
+
+  function buildMarkdownFromPayload(payload) {
+    const title = payload?.title ? `# ${payload.title}\n\n` : "";
+    const meta = payload
+      ? `> Exported: ${payload.exportedAt}\n> URL: ${payload.url}\n\n`
+      : "";
+
+    const parts = [title, meta];
+    for (const turn of payload.turns || []) {
+      const messages = turn.messages || [];
+      for (const msg of messages) {
+        const role = msg.role === CONFIG.userRole ? "You" : "Assistant";
+        const header = `## ${role}\n\n`;
+        const body = msg.text ? `${msg.text}\n\n` : "_(empty)_\n\n";
+        parts.push(header, body);
+      }
+    }
+    return parts.join("");
+  }
+
+  function buildPlainTextFromPayload(payload) {
+    const lines = [];
+    if (payload?.title) {
+      lines.push(payload.title);
+      lines.push("".padEnd(payload.title.length, "="));
+    }
+    if (payload?.exportedAt) {
+      lines.push(`Exported: ${payload.exportedAt}`);
+    }
+    if (payload?.url) {
+      lines.push(`URL: ${payload.url}`);
+    }
+    lines.push("");
+
+    for (const turn of payload.turns || []) {
+      const messages = turn.messages || [];
+      for (const msg of messages) {
+        const role = msg.role === CONFIG.userRole ? "You" : "Assistant";
+        lines.push(`[${role}]`);
+        lines.push(msg.text || "");
+        lines.push("");
+      }
+    }
+    return lines.join("\n");
+  }
+
+  function buildCsvFromPayload(payload) {
+    const rows = [
+      ["sequence", "turnIndex", "role", "text", "messageId", "turnId", "model"].join(",")
+    ];
+
+    for (const turn of payload.turns || []) {
+      const messages = turn.messages || [];
+      for (const msg of messages) {
+        const row = [
+          msg.sequence,
+          msg.turnIndex,
+          escapeCsv(msg.role),
+          escapeCsv(msg.text || ""),
+          escapeCsv(msg.messageId || ""),
+          escapeCsv(msg.turnId || ""),
+          escapeCsv(msg.model || "")
+        ];
+        rows.push(row.join(","));
+      }
+    }
+
+    return rows.join("\n");
+  }
+
+  function escapeCsv(value) {
+    const text = String(value ?? "");
+    if (/[",\n]/.test(text)) {
+      return `"${text.replace(/"/g, "\"\"")}"`;
+    }
+    return text;
   }
 
   function jumpToTurn(turnIndex) {
