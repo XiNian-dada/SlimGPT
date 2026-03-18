@@ -41,7 +41,10 @@
     searchMinChars: 2,
     statsUpdateThrottleMs: 400,
     maxSnippetLength: 120,
-    minPlaceholderHeight: 24
+    minPlaceholderHeight: 24,
+    sidebarOffsetGapPx: 18,
+    sidebarFollowDurationMs: 360,
+    sidebarResolveMinIntervalMs: 280
   };
 
   const STATE = {
@@ -92,6 +95,16 @@
     statsLastUpdateAt: 0,
     lastSyncDurationMs: 0,
     lastSyncAt: 0,
+    minimapEl: null,
+    minimapTrackEl: null,
+    minimapPanelEl: null,
+    minimapPreviewEl: null,
+    statsBadgeEl: null,
+    lastSidebarOffsetPx: -1,
+    sidebarAnchorEl: null,
+    lastSidebarResolveAt: 0,
+    layoutFollowRaf: 0,
+    layoutFollowUntil: 0,
     searchQuery: "",
     searchMatches: [],
     searchIndex: -1,
@@ -132,6 +145,19 @@
       clearTimeout(STATE.minimapDeferredTimer);
       STATE.minimapDeferredTimer = 0;
     }
+    if (STATE.layoutFollowRaf !== 0) {
+      cancelAnimationFrame(STATE.layoutFollowRaf);
+      STATE.layoutFollowRaf = 0;
+    }
+    STATE.layoutFollowUntil = 0;
+    STATE.lastSidebarOffsetPx = -1;
+    STATE.sidebarAnchorEl = null;
+    STATE.lastSidebarResolveAt = 0;
+    STATE.minimapEl = null;
+    STATE.minimapTrackEl = null;
+    STATE.minimapPanelEl = null;
+    STATE.minimapPreviewEl = null;
+    STATE.statsBadgeEl = null;
     if (STATE.typingSyncTimer !== 0) {
       clearTimeout(STATE.typingSyncTimer);
       STATE.typingSyncTimer = 0;
@@ -170,7 +196,33 @@
   }
 
   function bindGlobalListeners() {
-    window.addEventListener("resize", scheduleSync, { passive: true });
+    window.addEventListener("resize", () => {
+      requestLayoutFollow();
+      scheduleSync();
+    }, { passive: true });
+
+    document.addEventListener("transitionrun", handleLayoutTransitionEvent, { capture: true, passive: true });
+    document.addEventListener("transitionend", handleLayoutTransitionEvent, { capture: true, passive: true });
+    document.addEventListener(
+      "click",
+      (event) => {
+        if (!(event.target instanceof Element)) {
+          return;
+        }
+
+        const clickable = event.target.closest("button, [role='button'], a");
+        if (!(clickable instanceof HTMLElement)) {
+          return;
+        }
+
+        const rect = clickable.getBoundingClientRect();
+        const sidebarProbeEdge = Math.max(220, STATE.lastSidebarOffsetPx + 120);
+        if (rect.top <= 140 && rect.left <= sidebarProbeEdge) {
+          requestLayoutFollow();
+        }
+      },
+      { capture: true }
+    );
 
     // Capture scroll from nested scroll containers as well.
     document.addEventListener(
@@ -532,6 +584,7 @@
         activateConversationFeatures();
       }
 
+      updateSidebarOffset();
       ensureMiniMap();
 
       const typingHot = isTypingHot();
@@ -1252,7 +1305,7 @@
       return;
     }
 
-    if (document.querySelector("[data-slimgpt-minimap]")) {
+    if (getMinimapEl()) {
       return;
     }
 
@@ -1385,6 +1438,10 @@
     minimap.appendChild(actions);
     document.body.appendChild(minimap);
     document.body.appendChild(preview);
+    STATE.minimapEl = minimap;
+    STATE.minimapTrackEl = track;
+    STATE.minimapPreviewEl = preview;
+    updateSidebarOffset(true);
   }
 
   function updateMiniMap(force = false) {
@@ -1392,10 +1449,10 @@
       return;
     }
 
-    const root = document.querySelector("[data-slimgpt-minimap]");
+    const root = getMinimapEl();
     if (!(root instanceof HTMLElement)) return;
 
-    const track = root.querySelector(".slimgpt-minimap-track");
+    const track = getMinimapTrackEl();
     if (!(track instanceof HTMLElement)) return;
 
     if (force && STATE.minimapDeferredTimer !== 0) {
@@ -1999,7 +2056,7 @@
   }
 
   function updateStatsToggleLabel() {
-    const panel = document.querySelector("[data-slimgpt-panel='1']");
+    const panel = getMinimapPanelEl();
     if (!(panel instanceof HTMLElement)) {
       return;
     }
@@ -2010,7 +2067,7 @@
   }
 
   function ensureStatsBadge() {
-    if (document.querySelector("[data-slimgpt-stats='1']")) {
+    if (getStatsBadgeEl()) {
       return;
     }
 
@@ -2019,10 +2076,12 @@
     badge.setAttribute("data-slimgpt-stats", "1");
     badge.textContent = "Stats: --";
     document.body.appendChild(badge);
+    STATE.statsBadgeEl = badge;
   }
 
   function removeStatsBadge() {
-    document.querySelector("[data-slimgpt-stats='1']")?.remove();
+    getStatsBadgeEl()?.remove();
+    STATE.statsBadgeEl = null;
   }
 
   function updatePerfStats(force = false) {
@@ -2036,7 +2095,7 @@
     }
     STATE.statsLastUpdateAt = now;
 
-    const badge = document.querySelector("[data-slimgpt-stats='1']");
+    const badge = getStatsBadgeEl();
     if (!(badge instanceof HTMLElement)) {
       return;
     }
@@ -2061,7 +2120,7 @@
   }
 
   function ensureMinimapPanel() {
-    if (document.querySelector("[data-slimgpt-panel]")) {
+    if (getMinimapPanelEl()) {
       return;
     }
 
@@ -2079,6 +2138,7 @@
     });
 
     document.body.appendChild(panel);
+    STATE.minimapPanelEl = panel;
     updateStatsToggleLabel();
 
     if (!STATE.panelBound) {
@@ -2237,7 +2297,7 @@
   }
 
   function openMinimapPanel() {
-    const panel = document.querySelector("[data-slimgpt-panel='1']");
+    const panel = getMinimapPanelEl();
     if (!(panel instanceof HTMLElement)) {
       return;
     }
@@ -2253,7 +2313,7 @@
   }
 
   function closeMinimapPanel() {
-    const panel = document.querySelector("[data-slimgpt-panel='1']");
+    const panel = getMinimapPanelEl();
     if (!(panel instanceof HTMLElement)) {
       return;
     }
@@ -2262,13 +2322,13 @@
   }
 
   function isMinimapPanelOpen() {
-    const panel = document.querySelector("[data-slimgpt-panel='1']");
+    const panel = getMinimapPanelEl();
     return !!(panel instanceof HTMLElement && panel.classList.contains("is-open"));
   }
 
   function positionMinimapPanel() {
-    const panel = document.querySelector("[data-slimgpt-panel='1']");
-    const anchor = document.querySelector("[data-slimgpt-minimap]");
+    const panel = getMinimapPanelEl();
+    const anchor = getMinimapEl();
     if (!(panel instanceof HTMLElement) || !(anchor instanceof HTMLElement)) {
       return;
     }
@@ -2282,6 +2342,282 @@
 
     panel.style.left = `${Math.max(12, left)}px`;
     panel.style.top = `${top}px`;
+  }
+
+  function handleLayoutTransitionEvent(event) {
+    if (!isConversationPage()) {
+      return;
+    }
+
+    if (!(event.target instanceof HTMLElement)) {
+      return;
+    }
+
+    if (event.target.closest("[data-slimgpt-minimap], [data-slimgpt-panel], [data-slimgpt-preview]")) {
+      return;
+    }
+
+    const propertyName = String(event.propertyName || "");
+    if (propertyName && !/(width|left|right|transform|margin|padding|flex|grid)/i.test(propertyName)) {
+      return;
+    }
+
+    const rect = event.target.getBoundingClientRect();
+    if (rect.right <= 0 || rect.left > Math.max(24, window.innerWidth * 0.4)) {
+      return;
+    }
+
+    requestLayoutFollow();
+  }
+
+  function requestLayoutFollow(durationMs = CONFIG.sidebarFollowDurationMs) {
+    if (!isConversationPage()) {
+      return;
+    }
+
+    STATE.layoutFollowUntil = Math.max(
+      STATE.layoutFollowUntil,
+      performance.now() + durationMs
+    );
+
+    if (STATE.layoutFollowRaf !== 0) {
+      return;
+    }
+
+    const tick = () => {
+      STATE.layoutFollowRaf = 0;
+      updateSidebarOffset(false);
+      if (performance.now() < STATE.layoutFollowUntil) {
+        STATE.layoutFollowRaf = requestAnimationFrame(tick);
+      } else {
+        STATE.layoutFollowUntil = 0;
+      }
+    };
+
+    STATE.layoutFollowRaf = requestAnimationFrame(tick);
+  }
+
+  function updateSidebarOffset(force = false) {
+    const nextOffsetPx = measureSidebarOffsetPx(force);
+    if (!force && nextOffsetPx === STATE.lastSidebarOffsetPx) {
+      if (isMinimapPanelOpen()) {
+        positionMinimapPanel();
+      }
+      return;
+    }
+
+    STATE.lastSidebarOffsetPx = nextOffsetPx;
+    document.documentElement.style.setProperty("--slimgpt-sidebar-width", `${nextOffsetPx}px`);
+
+    if (isMinimapPanelOpen()) {
+      positionMinimapPanel();
+    }
+  }
+
+  function measureSidebarOffsetPx(forceResolve = false) {
+    const mainLeft = getMainContentLeftPx();
+    if (mainLeft > 0) {
+      return Math.round(mainLeft + CONFIG.sidebarOffsetGapPx);
+    }
+
+    const maxCandidateRight = Math.max(
+      180,
+      Math.min(window.innerWidth * 0.48, 720)
+    );
+    const cachedRight = getSidebarRightFromElement(STATE.sidebarAnchorEl, maxCandidateRight);
+    if (cachedRight > 0 && !forceResolve) {
+      return Math.round(cachedRight + CONFIG.sidebarOffsetGapPx);
+    }
+
+    const anchor = resolveSidebarAnchor(maxCandidateRight, forceResolve);
+    const anchorRight = getSidebarRightFromElement(anchor, maxCandidateRight);
+    if (anchorRight > 0) {
+      return Math.round(anchorRight + CONFIG.sidebarOffsetGapPx);
+    }
+
+    if (cachedRight > 0) {
+      return Math.round(cachedRight + CONFIG.sidebarOffsetGapPx);
+    }
+
+    if (STATE.lastSidebarOffsetPx > 0) {
+      return STATE.lastSidebarOffsetPx;
+    }
+
+    if (!anchorRight) {
+      return window.innerWidth < 900 ? 96 : 268;
+    }
+    return Math.round(anchorRight + CONFIG.sidebarOffsetGapPx);
+  }
+
+  function getMainContentLeftPx() {
+    const main = document.querySelector("main");
+    if (!(main instanceof HTMLElement)) {
+      return 0;
+    }
+
+    const rect = main.getBoundingClientRect();
+    if (
+      rect.width < 240 ||
+      rect.height < 160 ||
+      rect.left < 32 ||
+      rect.left > window.innerWidth * 0.55
+    ) {
+      return 0;
+    }
+
+    const style = window.getComputedStyle(main);
+    if (
+      style.display === "none" ||
+      style.visibility === "hidden" ||
+      Number.parseFloat(style.opacity || "1") === 0
+    ) {
+      return 0;
+    }
+
+    return Math.round(rect.left);
+  }
+
+  function buildSidebarSamplePoints() {
+    const height = window.innerHeight;
+    const topInset = 72;
+    const bottomInset = 72;
+    return [
+      clamp(topInset, 8, Math.max(8, height - 8)),
+      clamp(Math.round(height * 0.28), 8, Math.max(8, height - 8)),
+      clamp(Math.round(height * 0.5), 8, Math.max(8, height - 8)),
+      clamp(Math.round(height * 0.72), 8, Math.max(8, height - 8)),
+      clamp(height - bottomInset, 8, Math.max(8, height - 8))
+    ];
+  }
+
+  function measureSidebarCandidateTree(startEl, maxCandidateRight) {
+    let bestEl = null;
+    let bestRight = 0;
+    let node = startEl;
+
+    while (node instanceof HTMLElement) {
+      if (isSidebarCandidate(node, maxCandidateRight)) {
+        const right = Math.round(node.getBoundingClientRect().right);
+        if (right > bestRight) {
+          bestRight = right;
+          bestEl = node;
+        }
+      }
+      node = node.parentElement;
+    }
+
+    return bestEl;
+  }
+
+  function resolveSidebarAnchor(maxCandidateRight, forceResolve = false) {
+    const cached = STATE.sidebarAnchorEl;
+    if (getSidebarRightFromElement(cached, maxCandidateRight) > 0) {
+      return cached;
+    }
+
+    const now = performance.now();
+    if (!forceResolve && now - STATE.lastSidebarResolveAt < CONFIG.sidebarResolveMinIntervalMs) {
+      return cached;
+    }
+
+    STATE.lastSidebarResolveAt = now;
+
+    const samplePoints = buildSidebarSamplePoints();
+    let bestEl = null;
+    let bestRight = 0;
+    for (const y of samplePoints) {
+      const stack = document.elementsFromPoint(12, y);
+      for (const el of stack) {
+        const candidate = measureSidebarCandidateTree(el, maxCandidateRight);
+        const right = getSidebarRightFromElement(candidate, maxCandidateRight);
+        if (right > bestRight) {
+          bestRight = right;
+          bestEl = candidate;
+        }
+      }
+    }
+
+    const queried = querySidebarCandidateElement(maxCandidateRight);
+    const queriedRight = getSidebarRightFromElement(queried, maxCandidateRight);
+    if (queriedRight > bestRight) {
+      bestEl = queried;
+      bestRight = queriedRight;
+    }
+
+    STATE.sidebarAnchorEl = bestEl;
+    return bestEl;
+  }
+
+  function querySidebarCandidateElement(maxCandidateRight) {
+    let bestEl = null;
+    let bestRight = 0;
+    const selectors = [
+      "aside",
+      "nav",
+      "[role='navigation']",
+      "[data-testid*='sidebar']",
+      "[data-sidebar]",
+      "[class*='sidebar']",
+      "[class*='Sidebar']"
+    ];
+
+    for (const el of document.querySelectorAll(selectors.join(","))) {
+      if (!(el instanceof HTMLElement)) {
+        continue;
+      }
+      const right = getSidebarRightFromElement(el, maxCandidateRight);
+      if (right > bestRight) {
+        bestRight = right;
+        bestEl = el;
+      }
+    }
+
+    return bestEl;
+  }
+
+  function getSidebarRightFromElement(el, maxCandidateRight) {
+    if (!isSidebarCandidate(el, maxCandidateRight)) {
+      return 0;
+    }
+
+    return Math.round(el.getBoundingClientRect().right);
+  }
+
+  function isSidebarCandidate(el, maxCandidateRight) {
+    if (!(el instanceof HTMLElement)) {
+      return false;
+    }
+
+    if (
+      el === document.body ||
+      el === document.documentElement ||
+      el.matches("[data-slimgpt-minimap], [data-slimgpt-panel], [data-slimgpt-preview], [data-slimgpt-stats]") ||
+      el.closest("[data-slimgpt-minimap], [data-slimgpt-panel], [data-slimgpt-preview], [data-slimgpt-stats]")
+    ) {
+      return false;
+    }
+
+    const rect = el.getBoundingClientRect();
+    if (
+      rect.width < 44 ||
+      rect.height < 120 ||
+      rect.left > 24 ||
+      rect.right < 44 ||
+      rect.right > maxCandidateRight
+    ) {
+      return false;
+    }
+
+    const style = window.getComputedStyle(el);
+    if (
+      style.display === "none" ||
+      style.visibility === "hidden" ||
+      Number.parseFloat(style.opacity || "1") === 0
+    ) {
+      return false;
+    }
+
+    return true;
   }
 
   function buildMarkdownFromPayload(payload) {
@@ -2492,7 +2828,7 @@
   }
 
   function renderDotPreview(snapshot, dot) {
-    const preview = document.querySelector("[data-slimgpt-preview='1']");
+    const preview = getMinimapPreviewEl();
     if (!(preview instanceof HTMLDivElement)) return;
 
     preview.replaceChildren(
@@ -2523,7 +2859,7 @@
   }
 
   function hideDotPreview() {
-    const preview = document.querySelector("[data-slimgpt-preview='1']");
+    const preview = getMinimapPreviewEl();
     if (!(preview instanceof HTMLDivElement)) {
       return;
     }
@@ -2532,7 +2868,7 @@
   }
 
   function positionDotPreview(dot) {
-    const preview = document.querySelector("[data-slimgpt-preview='1']");
+    const preview = getMinimapPreviewEl();
     if (!(preview instanceof HTMLDivElement)) {
       return;
     }
@@ -2556,6 +2892,57 @@
 
     preview.style.top = `${top}px`;
     preview.style.left = `${Math.max(8, left)}px`;
+  }
+
+  function getMinimapEl() {
+    if (STATE.minimapEl instanceof HTMLElement && STATE.minimapEl.isConnected) {
+      return STATE.minimapEl;
+    }
+
+    const el = document.querySelector("[data-slimgpt-minimap]");
+    STATE.minimapEl = el instanceof HTMLElement ? el : null;
+    return STATE.minimapEl;
+  }
+
+  function getMinimapTrackEl() {
+    if (STATE.minimapTrackEl instanceof HTMLElement && STATE.minimapTrackEl.isConnected) {
+      return STATE.minimapTrackEl;
+    }
+
+    const root = getMinimapEl();
+    const el = root?.querySelector(".slimgpt-minimap-track");
+    STATE.minimapTrackEl = el instanceof HTMLElement ? el : null;
+    return STATE.minimapTrackEl;
+  }
+
+  function getMinimapPanelEl() {
+    if (STATE.minimapPanelEl instanceof HTMLElement && STATE.minimapPanelEl.isConnected) {
+      return STATE.minimapPanelEl;
+    }
+
+    const el = document.querySelector("[data-slimgpt-panel='1']");
+    STATE.minimapPanelEl = el instanceof HTMLElement ? el : null;
+    return STATE.minimapPanelEl;
+  }
+
+  function getMinimapPreviewEl() {
+    if (STATE.minimapPreviewEl instanceof HTMLDivElement && STATE.minimapPreviewEl.isConnected) {
+      return STATE.minimapPreviewEl;
+    }
+
+    const el = document.querySelector("[data-slimgpt-preview='1']");
+    STATE.minimapPreviewEl = el instanceof HTMLDivElement ? el : null;
+    return STATE.minimapPreviewEl;
+  }
+
+  function getStatsBadgeEl() {
+    if (STATE.statsBadgeEl instanceof HTMLElement && STATE.statsBadgeEl.isConnected) {
+      return STATE.statsBadgeEl;
+    }
+
+    const el = document.querySelector("[data-slimgpt-stats='1']");
+    STATE.statsBadgeEl = el instanceof HTMLElement ? el : null;
+    return STATE.statsBadgeEl;
   }
 
   function getItemText(item) {

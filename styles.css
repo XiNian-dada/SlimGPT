@@ -21,6 +21,7 @@
   align-items: center;
   gap: 6px;
   padding: 2px 0;
+  transition: left 0.18s cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 .slimgpt-minimap-track {
@@ -182,6 +183,7 @@
   z-index: 2147483646;
   pointer-events: none;
   white-space: nowrap;
+  transition: left 0.18s cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 .slimgpt-minimap-dot {
