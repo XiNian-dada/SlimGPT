@@ -1,137 +1,52 @@
 # SlimGPT
 
-SlimGPT 是一个 Chrome / Edge Manifest V3 扩展，目标是让 ChatGPT 在超长对话里依然保持流畅。
+SlimGPT 是一个 Chrome / Edge Manifest V3 扩展，只通过 Content Script 修改 ChatGPT 页面 DOM。
 
-核心思路：只做减法，只操作 DOM，不碰 ChatGPT 内部 React 状态。
+## 功能
 
-## 解决的问题
+- 长对话虚拟化
+  - 仅保留视口附近的消息为完整 DOM
+  - 远离视口的旧消息折叠为占位节点
+  - 滚动时自动恢复附近内容，再把远处内容折叠掉
+- Minimap
+  - 右侧点位表示对话位置
+  - 点击点位快速跳转
+  - hover 显示该 turn 的快照预览
+  - 支持搜索定位、JSON / Markdown / TXT / CSV 导出
+- 行内公式
+  - 补渲染 ChatGPT 未处理的 `$...$` 行内公式
+  - 使用本地离线 KaTeX，不依赖 CDN
+  - 点击公式可复制 TeX
+- 输入框扩展
+  - 一键把 composer 输入区放大
+  - 再次点击或发送消息后恢复
+- 性能统计
+  - 可选显示 turns / full / collapsed / sync 耗时
 
-长对话中 ChatGPT 会累积大量消息节点，导致：
+## 原理
 
-- 滚动时卡顿
-- 输入框打字变慢
-- 快速跳转体验变差
-- 页面首次进入和刷新变慢
+- 只用 DOM + `MutationObserver` + `requestAnimationFrame`
+- 不依赖 ChatGPT 内部 React 状态
+- 通过语义属性识别消息，例如 `data-message-author-role`
+- 通过占位节点维持滚动高度，避免列表突变
+- 对高频路径做节流和缓存，减少重建与查询开销
+- KaTeX 和字体都放在 `vendor/katex`，离线加载
 
-SlimGPT 通过“对话虚拟化 + 视口优先恢复 + 后台折叠”降低主线程压力。
+## 安装
 
-## 主要功能
+1. 打开 `chrome://extensions` 或 `edge://extensions`
+2. 开启“开发者模式”
+3. 点击“加载已解压的扩展程序”
+4. 选择这个仓库根目录
+5. 打开 `https://chatgpt.com/c/...` 即可生效
 
-### 1. 动态对话虚拟化（核心）
-
-- 仅保留视口附近的 turn 为完整 DOM
-- 远离视口的旧消息替换为等高 placeholder
-- 上翻/下翻时自动恢复附近消息
-- 保持滚动高度稳定，不出现跳动
-
-### 2. 输入优先策略
-
-- 检测输入焦点、键入、组合输入（IME）
-- 打字期间显著降低折叠/重建预算
-- 避免输入线程被后台 DOM 工作抢占
-
-### 3. Minimap 快速导航
-
-- 左侧迷你轨道展示对话位置
-- 点击点位可快速跳转到对应 turn
-- 当前视口对应点位高亮（绿色呼吸效果）
-- hover 预览该段上下文摘要（上一个 GPT / 用户 / 下一个 GPT）
-
-### 4. 行内公式渲染与复制
-
-- 补渲染 ChatGPT 未处理的 `$...$` 行内公式
-- 使用本地离线 KaTeX（`vendor/katex`），不依赖 CDN
-- 点击公式即可复制对应 TeX
-- 支持增量流式渲染，同时带稳定性节流
-
-### 5. 输入框扩展按钮
-
-- 在 composer 区域注入扩展按钮
-- 一键把输入区高度放大到约 5 倍（受视口上限保护）
-- 回车发送或再次点击可收起
-
-### 6. 会话切换与刷新恢复
-
-- 监听 URL 变化，自动重建模型
-- 刷新后有引导重试机制，避免首次模型为空导致 UI 丢失
-
-### 7. 聊天记录导出（JSON / Markdown / TXT / CSV）
-
-- 通过 minimap 面板导出整段对话（多格式）
-- 导出包含 turn / role / 文本 / messageId 等字段
-
-### 8. 搜索定位（长对话）
-
-- 在侧边面板内搜索关键词
-- 支持上一个 / 下一个命中跳转
-- 可跨折叠内容搜索
-
-### 9. 性能统计（可选）
-
-- 可在面板中打开轻量统计
-- 显示 turns / full / collapsed / sync 耗时
-
-## 技术特性
-
-- Manifest V3
-- 纯 Content Script（`content.js` + `styles.css`）
-- 基于 `MutationObserver` 监听消息变化
-- 不写死易碎 class 作为唯一判断依据（优先语义与 data 属性）
-- 无 OpenAI API 调用
-- 不保存用户隐私数据
-- 零配置安装即生效
-
-## 项目结构
+## 目录
 
 ```text
 SlimGPT/
 ├── manifest.json
 ├── content.js
 ├── styles.css
-├── vendor/
-│   └── katex/
-│       ├── katex.min.js
-│       ├── katex.min.css
-│       └── fonts/
-└── .github/
-    └── workflows/
-        └── package.yml
+├── vendor/katex/
+└── .github/workflows/package.yml
 ```
-
-## 安装方式（Chrome / Edge）
-
-1. 打开 `chrome://extensions` 或 `edge://extensions`
-2. 开启“开发者模式”
-3. 点击“加载已解压的扩展程序”
-4. 选择 SlimGPT 项目根目录
-
-## 开发与调试
-
-- 修改 `content.js` / `styles.css` 后，在扩展管理页点击“重新加载”
-- 在 ChatGPT 页面刷新后验证行为
-- 建议观察以下指标：
-  - 输入延迟
-  - 快速滚动时恢复速度
-  - 长对话内 DOM 数量变化
-  - 控制台是否出现扩展自身报错
-
-## CI 打包
-
-仓库包含 GitHub Actions 工作流：每次 push 自动打包扩展 zip 并上传 artifact。
-
-文件位置：`.github/workflows/package.yml`
-
-## 非目标
-
-- 不改写 prompt
-- 不接 OpenAI API
-- 不做账号体系/云同步
-- 不做复杂设置面板
-
-## 兼容性
-
-- Chrome（Manifest V3）
-- Edge（Manifest V3）
-- 目标站点：
-  - `https://chatgpt.com/*`
-  - `https://chat.openai.com/*`
