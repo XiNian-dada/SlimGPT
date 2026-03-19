@@ -1337,7 +1337,7 @@
     menuBtn.className = "slimgpt-minimap-action";
     menuBtn.setAttribute("data-slimgpt-menu", "1");
     menuBtn.setAttribute("aria-label", "Open SlimGPT menu");
-    menuBtn.textContent = "⋯";
+    menuBtn.textContent = "...";
     menuBtn.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
